@@ -11,17 +11,21 @@ MOCK_EVENT = {
     "_id": "664f1a2b3c4d5e6f7a8b9c0d",
     "title": "Festival de Jazz GDL",
     "description": "El mejor festival de jazz de Guadalajara.",
-    "category": "música",
-    "tags": ["jazz"],
+    "category": "cultural",
+    "date_start": "2025-08-15T20:00:00+00:00",
+    "date_end": None,
+    "location": "Teatro Degollado",
+    "coordinates": None,
     "image_url": "https://example.com/jazz.jpg",
-    "start_date": "2025-08-15T20:00:00+00:00",
+    "url_source": "https://eventbrite.com/e/festival-jazz-gdl",
     "price": 150.0,
-    "currency": "MXN",
-    "url": "https://eventbrite.com/e/festival-jazz-gdl",
-    "location": {"address": "Teatro Degollado", "lat": 20.67, "lon": -103.34},
-    "status": "publicado",
+    "tags": ["jazz"],
     "quality_ml": 0.87,
+    "status": "publicado",
+    "created_at": "2025-08-01T00:00:00+00:00",
+    "updated_at": None,
 }
+
 
 class TestHealth:
     @pytest.mark.anyio
@@ -34,6 +38,7 @@ class TestHealth:
     async def test_docs_available(self, client):
         response = await client.get("/api/docs")
         assert response.status_code == 200
+
 
 class TestAuth:
     @pytest.mark.anyio
@@ -58,18 +63,31 @@ class TestAuth:
         response = await client.post("/api/auth/login", json={})
         assert response.status_code == 422
 
+
 class TestEvents:
     @pytest.mark.anyio
     async def test_list_events(self, client):
         with patch("api.routes.events.event_service.list_events", new_callable=AsyncMock) as m:
-            m.return_value = {"events": [MOCK_EVENT], "total": 1, "page": 1, "pages": 1}
+            m.return_value = {
+                "items": [MOCK_EVENT],
+                "total": 1,
+                "page": 1,
+                "limit": 20,
+                "has_next": False,
+            }
             response = await client.get("/api/events")
             assert response.status_code == 200
 
     @pytest.mark.anyio
     async def test_list_events_empty(self, client):
         with patch("api.routes.events.event_service.list_events", new_callable=AsyncMock) as m:
-            m.return_value = {"events": [], "total": 0, "page": 1, "pages": 0}
+            m.return_value = {
+                "items": [],
+                "total": 0,
+                "page": 1,
+                "limit": 20,
+                "has_next": False,
+            }
             response = await client.get("/api/events")
             assert response.status_code == 200
 
@@ -79,6 +97,7 @@ class TestEvents:
             m.side_effect = HTTPException(status_code=404, detail="Evento no encontrado")
             response = await client.get("/api/events/000000000000000000000000")
             assert response.status_code == 404
+
 
 class TestInteractions:
     @pytest.mark.anyio
@@ -90,6 +109,7 @@ class TestInteractions:
     async def test_my_interactions_without_token(self, client):
         response = await client.get("/api/interactions/my")
         assert response.status_code in (401, 403)
+
 
 class TestAdmin:
     @pytest.mark.anyio

@@ -5,6 +5,7 @@ Middleware y dependencias FastAPI para autenticación JWT.
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import JWTError, jwt
+from bson import ObjectId
 from datetime import datetime, timezone
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -61,18 +62,21 @@ async def get_current_user(
             detail="Token de autenticación requerido.",
             headers={"WWW-Authenticate": "Bearer"},
         )
+
     token_data = _decode_token(credentials.credentials)
 
     # Verificar que el usuario sigue activo en la BD
     user = await db.users.find_one(
-        {"_id": token_data.user_id},
+        {"_id": ObjectId(token_data.user_id)},  # ✅ Convertir a ObjectId
         {"_id": 1, "role": 1},
     )
+
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Usuario no encontrado.",
         )
+
     return token_data
 
 

@@ -3,37 +3,61 @@ tests/conftest.py
 Configuración global de pytest.
 Mockea MongoDB para que los tests no dependan de una conexión real.
 """
-
 import pytest
+import pytest_asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from httpx import AsyncClient, ASGITransport
 
 
-# ── Mock de la base de datos ──────────────────────────────────────────
-
-@pytest.fixture(autouse=True)
-def mock_database():
-    """
-    Mockea get_db para que todos los tests no necesiten MongoDB.
-    autouse=True significa que se aplica automáticamente a todos los tests.
-    """
+def _make_mock_db():
     mock_db = MagicMock()
 
-    # Mockea las colecciones más usadas
-    mock_db.events = MagicMock()
-    mock_db.users = MagicMock()
-    mock_db.user_interactions = MagicMock()
-    mock_db.user_preferences = MagicMock()
-    mock_db.reviews_manual = MagicMock()
+    for col_name in ("events", "users", "user_interactions", "user_preferences", "reviews_manual"):
+        col = MagicMock()
+        col.find_one = AsyncMock(return_value=None)
+        col.count_documents = AsyncMock(return_value=0)
+        col.insert_one = AsyncMock(return_value=MagicMock(inserted_id="fake_id"))
+        col.update_one = AsyncMock(return_value=None)
+        col.find = MagicMock(return_value=MagicMock(
+            sort=MagicMock(return_value=MagicMock(
+                skip=MagicMock(return_value=MagicMock(
+                    limit=MagicMock(return_value=MagicMock(
+                        to_list=AsyncMock(return_value=[])
+                    ))
+                ))
+            ))
+        ))
+        setattr(mock_db, col_name, col)
 
-    with patch("api.config.database.get_db", return_value=mock_db), \
-         patch("api.config.database._db", mock_db):
-        yield mock_db
+    return mock_db
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest_asyncio.fixture
+async def client():
+    from api.main import app
+    from api.config.database import get_db
+
+    mock_db = _make_mock_db()
+
+    # Así es como FastAPI intercepta dependencias correctamente
+    app.dependency_overrides[get_db] = lambda: mock_db
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+    ) as ac:
+        yield ac
+
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture(autouse=True)
 def mock_connect_db():
-    """Mockea connect_db para que no intente conectarse a Atlas."""
     with patch("api.config.database.connect_db", new_callable=AsyncMock), \
          patch("api.config.database.disconnect_db", new_callable=AsyncMock):
         yield
@@ -41,22 +65,5 @@ def mock_connect_db():
 
 @pytest.fixture(autouse=True)
 def mock_ml_models():
-    """Mockea la carga de modelos ML."""
     with patch("api.services.ml_service.load_ml_models", return_value=None):
         yield
-
-
-# ── Cliente HTTP de prueba ────────────────────────────────────────────
-
-@pytest.fixture
-def anyio_backend():
-    return "asyncio"
-
-
-@pytest.fixture
-async def client():
-    from api.main import app
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as ac:
-        yield ac
