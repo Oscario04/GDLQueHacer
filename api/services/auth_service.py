@@ -2,9 +2,9 @@
 services/auth_service.py
 Lógica de negocio para registro, login y generación de JWT.
 """
+import bcrypt
 from fastapi import HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from passlib.context import CryptContext
 from jose import jwt
 from datetime import datetime, timedelta, timezone
 from bson import ObjectId
@@ -17,20 +17,22 @@ from api.models.user import (
 
 settings = get_settings()
 
-# Contexto bcrypt — factor de costo 12 (>= 10 según SRS)
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto", bcrypt__rounds=12)
-
 
 def _hash_password(plain: str) -> str:
-    return pwd_context.hash(plain)
+    return bcrypt.hashpw(
+        plain.encode("utf-8"),
+        bcrypt.gensalt(rounds=12)
+    ).decode("utf-8")
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return bcrypt.checkpw(
+        plain.encode("utf-8"),
+        hashed.encode("utf-8")
+    )
 
 
 def _create_access_token(user_id: str, email: str, role: str) -> str:
-    """Genera un JWT firmado con HS256 y expiración de 24 h."""
     expire = datetime.now(timezone.utc) + timedelta(hours=settings.JWT_EXPIRE_HOURS)
     payload = {
         "sub": user_id,
@@ -46,10 +48,6 @@ async def register_user(
     data: RegisterRequest,
     db: AsyncIOMotorDatabase,
 ) -> TokenResponse:
-    """
-    Crea una cuenta nueva. Lanza 409 si el correo ya existe.
-    Retorna JWT listo para usar.
-    """
     existing = await db.users.find_one({"email": data.email.lower()})
     if existing:
         raise HTTPException(
@@ -57,28 +55,28 @@ async def register_user(
             detail="El correo electrónico ya está registrado.",
         )
 
+    user_id = str(ObjectId())
     user_doc = {
-        "_id": str(ObjectId()),
+        "_id": user_id,
         "name": data.name.strip(),
         "email": data.email.lower(),
         "password_hash": _hash_password(data.password),
         "role": UserRole.user.value,
-        "created_at": datetime.utcnow(),
+        "created_at": datetime.now(timezone.utc),
     }
     await db.users.insert_one(user_doc)
 
-    # Crear documento de preferencias vacío
     await db.user_preferences.insert_one({
         "_id": str(ObjectId()),
-        "user_id": user_doc["_id"],
+        "user_id": user_id,
         "user_preference_vector": [],
         "top_categories": [],
         "interaction_count": 0,
-        "updated_at": datetime.utcnow(),
+        "updated_at": datetime.now(timezone.utc),
     })
 
     token = _create_access_token(
-        user_id=user_doc["_id"],
+        user_id=user_id,
         email=user_doc["email"],
         role=user_doc["role"],
     )
@@ -92,14 +90,9 @@ async def login_user(
     data: LoginRequest,
     db: AsyncIOMotorDatabase,
 ) -> TokenResponse:
-    """
-    Autentica con email/contraseña. Retorna JWT o lanza 401.
-    El mensaje de error es genérico para no revelar si el email existe.
-    """
     user = await db.users.find_one({"email": data.email.lower()})
 
-    # Siempre verificar hash (timing-safe) aunque no exista el usuario
-    dummy_hash = "$2b$12$abcdefghijklmnopqrstuuabcdefghijklmnopqrstuuabcdefghijkl"
+    dummy_hash = bcrypt.hashpw(b"dummy", bcrypt.gensalt()).decode("utf-8")
     stored_hash = user["password_hash"] if user else dummy_hash
 
     if not _verify_password(data.password, stored_hash) or user is None:
@@ -120,7 +113,6 @@ async def login_user(
 
 
 async def get_user_profile(user_id: str, db: AsyncIOMotorDatabase) -> dict:
-    """Retorna el perfil completo del usuario autenticado."""
     user = await db.users.find_one({"_id": user_id})
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
@@ -138,3 +130,21 @@ async def get_user_profile(user_id: str, db: AsyncIOMotorDatabase) -> dict:
         "total_interactions": interaction_count,
         "preferences_updated_at": prefs.get("updated_at"),
     }
+
+
+async def update_user_preferences(
+    user_id: str,
+    data,
+    db: AsyncIOMotorDatabase,
+) -> dict:
+    """Guarda las categorías preferidas del usuario en orden de prioridad."""
+    await db.user_preferences.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "preferred_categories": data.preferred_categories,
+            "top_categories": data.preferred_categories,
+            "updated_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+    return {"preferred_categories": data.preferred_categories}

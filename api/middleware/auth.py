@@ -52,10 +52,6 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> TokenData:
-    """
-    Dependencia FastAPI: extrae y valida el JWT del header Authorization.
-    Uso:  current_user: TokenData = Depends(get_current_user)
-    """
     if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -65,11 +61,17 @@ async def get_current_user(
 
     token_data = _decode_token(credentials.credentials)
 
-    # Verificar que el usuario sigue activo en la BD
-    user = await db.users.find_one(
-        {"_id": ObjectId(token_data.user_id)},  # ✅ Convertir a ObjectId
-        {"_id": 1, "role": 1},
-    )
+    # Busca por string o ObjectId para compatibilidad con usuarios anteriores
+    query: dict = {"_id": token_data.user_id}
+    try:
+        query = {"$or": [
+            {"_id": token_data.user_id},
+            {"_id": ObjectId(token_data.user_id)},
+        ]}
+    except Exception:
+        pass
+
+    user = await db.users.find_one(query, {"_id": 1, "role": 1})
 
     if user is None:
         raise HTTPException(
@@ -78,7 +80,6 @@ async def get_current_user(
         )
 
     return token_data
-
 
 async def get_optional_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),

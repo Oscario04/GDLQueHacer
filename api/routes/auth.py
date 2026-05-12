@@ -4,13 +4,13 @@ Endpoints de autenticación: registro, login y perfil del usuario.
 """
 from fastapi import APIRouter, Depends, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
-
 from api.config.database import get_db
 from api.middleware.auth import get_current_user
 from api.models.user import (
     RegisterRequest, LoginRequest, TokenResponse,
     UserPublic, UserProfile, TokenData,
 )
+from api.models.user import PreferencesRequest
 from api.services import auth_service
 
 router = APIRouter(prefix="/api/auth", tags=["Auth"])
@@ -58,3 +58,15 @@ async def get_me(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
     return await auth_service.get_user_profile(current_user.user_id, db)
+
+@router.patch(
+    "/preferences",
+    summary="Guardar categorías de preferencia",
+    description="Guarda las 3 categorías preferidas del usuario en orden de prioridad.",
+)
+async def update_preferences(
+    data: PreferencesRequest,
+    current_user: TokenData = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> dict:
+    return await auth_service.update_user_preferences(current_user.user_id, data, db)

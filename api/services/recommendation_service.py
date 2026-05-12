@@ -27,52 +27,45 @@ async def get_recommendations(
     db: AsyncIOMotorDatabase,
     limit: int = 20,
 ) -> list[dict[str, Any]]:
-    """
-    Pipeline de recomendación completo:
-    1. Obtiene el vector de preferencias del usuario
-    2. Carga los vectores TF-IDF de eventos disponibles
-    3. KNN: encuentra los K más cercanos al perfil del usuario
-    4. SVM scoring: re-rankea los candidatos
-    5. Filtra eventos ya vistos y devuelve los top-N
-    """
     # ── 1. Vector de preferencias del usuario ────────────────────────
     user_vector = await _build_user_vector(user_id, db)
 
+    # ── 2. Cargar preferencias de categorías ─────────────────────────
+    prefs_doc = await db.user_preferences.find_one({"user_id": user_id}) or {}
+    preferred_categories = prefs_doc.get("preferred_categories", [])
+
+    # Pesos por posición: 1ª = 1.0, 2ª = 0.6, 3ª = 0.3
+    CATEGORY_WEIGHTS = {cat: round(1.0 - i * 0.35, 2)
+                        for i, cat in enumerate(preferred_categories)}
+
     if user_vector is None or len(user_vector) == 0:
-        # Usuario sin historial → eventos recientes de alta calidad
-        return await _cold_start_recommendations(db, limit)
+        cold = await _cold_start_recommendations(db, limit)
+        return _apply_category_boost(cold, CATEGORY_WEIGHTS)
 
-    # ── 2. Cargar eventos con vectores TF-IDF ────────────────────────
+    # ── 3. Cargar eventos con vectores TF-IDF ────────────────────────
     events_with_vectors = await _load_events_with_vectors(db)
-
     if not events_with_vectors:
-        return await _cold_start_recommendations(db, limit)
+        cold = await _cold_start_recommendations(db, limit)
+        return _apply_category_boost(cold, CATEGORY_WEIGHTS)
 
-    event_ids = [e["_id"] for e in events_with_vectors]
     event_matrix = np.array([e["tfidf_vector"] for e in events_with_vectors])
-
-    # Alinear dimensiones si el vector del usuario difiere
     user_vec = np.array(user_vector)
+
     if user_vec.shape[0] != event_matrix.shape[1]:
         user_vec, event_matrix = _align_dimensions(user_vec, event_matrix)
 
-    # Normalizar para similitud coseno
     event_matrix_norm = normalize(event_matrix, norm="l2")
     user_vec_norm = normalize(user_vec.reshape(1, -1), norm="l2")[0]
 
-    # ── 3. KNN: K vecinos más cercanos al perfil ──────────────────────
-    n_neighbors = min(settings.KNN_N_NEIGHBORS * 3, len(event_ids))
+    # ── 4. KNN ────────────────────────────────────────────────────────
+    n_neighbors = min(settings.KNN_N_NEIGHBORS * 3, len(events_with_vectors))
     knn = NearestNeighbors(n_neighbors=n_neighbors, metric="cosine", algorithm="brute")
     knn.fit(event_matrix_norm)
-
     distances, indices = knn.kneighbors(user_vec_norm.reshape(1, -1))
-    distances = distances[0]
-    indices = indices[0]
-
-    # Similitud coseno = 1 - distancia
+    distances, indices = distances[0], indices[0]
     knn_scores = 1.0 - distances
 
-    # ── 4. SVM re-ranking sobre candidatos KNN ────────────────────────
+    # ── 5. SVM re-ranking ─────────────────────────────────────────────
     candidate_events = [events_with_vectors[i] for i in indices]
     candidate_scores = _svm_rerank(
         user_vec=user_vec_norm,
@@ -80,30 +73,37 @@ async def get_recommendations(
         knn_scores=knn_scores,
     )
 
-    # ── 5. Filtrar vistos y construir respuesta ───────────────────────
+    # ── 6. Boost por categorías preferidas ────────────────────────────
+    boosted_scores = []
+    for event, score in zip(candidate_events, candidate_scores):
+        cat = event.get("category", "")
+        boost = CATEGORY_WEIGHTS.get(cat, 0.0)
+        # Boost máximo de +0.15 para la 1ª categoría
+        final_score = min(1.0, score + boost * 0.15)
+        boosted_scores.append(final_score)
+
+    # ── 7. Filtrar vistos y construir respuesta ───────────────────────
     seen_ids = await _get_seen_event_ids(user_id, db)
     results = []
 
-    sorted_pairs = sorted(
-        zip(candidate_events, candidate_scores),
-        key=lambda x: x[1],
-        reverse=True,
-    )
-
-    for event, score in sorted_pairs:
+    for event, score in sorted(
+        zip(candidate_events, boosted_scores),
+        key=lambda x: x[1], reverse=True
+    ):
         if event["_id"] in seen_ids:
             continue
         event["recommendation_score"] = round(float(score), 4)
-        event["recommendation_reason"] = _get_reason(score)
+        event["recommendation_reason"] = _get_reason_with_category(
+            score, event.get("category", ""), CATEGORY_WEIGHTS
+        )
         event["_id"] = str(event["_id"])
         results.append(event)
-
         if len(results) >= limit:
             break
 
-    # Si no hay suficientes, completar con cold start
     if len(results) < limit // 2:
         cold = await _cold_start_recommendations(db, limit - len(results))
+        cold = _apply_category_boost(cold, CATEGORY_WEIGHTS)
         existing_ids = {r["_id"] for r in results}
         for e in cold:
             if e["_id"] not in existing_ids:
@@ -111,6 +111,40 @@ async def get_recommendations(
 
     return results[:limit]
 
+
+def _apply_category_boost(
+    events: list[dict], category_weights: dict[str, float]
+) -> list[dict]:
+    """Aplica boost de categoría a una lista de eventos (usado en cold start)."""
+    for event in events:
+        cat = event.get("category", "")
+        boost = category_weights.get(cat, 0.0)
+        base = event.get("recommendation_score", 0.5)
+        event["recommendation_score"] = round(min(1.0, base + boost * 0.15), 4)
+        event["recommendation_reason"] = _get_reason_with_category(
+            event["recommendation_score"], cat, category_weights
+        )
+    return sorted(events, key=lambda x: x["recommendation_score"], reverse=True)
+
+
+def _get_reason_with_category(
+    score: float, category: str, category_weights: dict[str, float]
+) -> str:
+    CATEGORY_LABELS = {
+        "cultural": "cultural", "deportivo": "deportivo",
+        "gastronomico": "gastronómico", "entretenimiento": "entretenimiento",
+        "otro": "variado",
+    }
+    if category in category_weights:
+        label = CATEGORY_LABELS.get(category, category)
+        rank = list(category_weights.keys()).index(category) + 1
+        if rank == 1:
+            return f"Tu categoría favorita: {label}"
+        elif rank == 2:
+            return f"Una de tus categorías preferidas: {label}"
+        else:
+            return f"Dentro de tus intereses: {label}"
+    return _get_reason(score)
 
 async def _build_user_vector(user_id: str, db: AsyncIOMotorDatabase) -> list[float] | None:
     """

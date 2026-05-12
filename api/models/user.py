@@ -87,3 +87,21 @@ class UserPreferencesDB(BaseModel):
     top_categories: list[str] = Field(default_factory=list)
     interaction_count: int = 0
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class PreferencesRequest(BaseModel):
+    """Categorías preferidas en orden de prioridad (máximo 3)."""
+    preferred_categories: list[str] = Field(
+        ..., min_length=1, max_length=3,
+        description="Lista ordenada de categorías: índice 0 = mayor prioridad"
+    )
+
+    @field_validator("preferred_categories")
+    @classmethod
+    def validate_categories(cls, v: list[str]) -> list[str]:
+        valid = {"cultural", "deportivo", "gastronomico", "entretenimiento", "otro"}
+        for cat in v:
+            if cat not in valid:
+                raise ValueError(f"Categoría inválida: {cat}")
+        if len(v) != len(set(v)):
+            raise ValueError("No puedes repetir categorías.")
+        return v

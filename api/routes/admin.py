@@ -1,17 +1,18 @@
 """
 routes/admin.py
 Endpoints exclusivos para el rol administrador.
-- Cola de revisión manual (quality_ml < 0.5)
-- Creación manual de eventos
-- Estadísticas del sistema
 """
 from fastapi import APIRouter, Depends, status, Query
+from fastapi.responses import StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from datetime import datetime
 from bson import ObjectId
+import asyncio
+import json
+import uuid
 
 from api.config.database import get_db
-from api.middleware.auth import require_admin
+from api.middleware.auth import require_admin, _decode_token
 from api.models.event import EventCreate, EventStatus, EventPublic
 from api.models.interaction import ReviewAction, ReviewStatus
 from api.models.user import TokenData
@@ -19,17 +20,14 @@ from api.services.event_service import create_event_manual, update_event_status
 
 router = APIRouter(prefix="/api/admin", tags=["Admin"])
 
+# Almacén en memoria de logs por job_id
+_job_logs: dict[str, list[str]] = {}
+_job_status: dict[str, str] = {}  # "running" | "done" | "error"
+
 
 # ── Cola de revisión manual ───────────────────────────────────────────
 
-@router.get(
-    "/reviews",
-    summary="Cola de revisión manual",
-    description=(
-        "Lista los eventos con quality_ml < 0.5 pendientes de revisión. "
-        "**Requiere rol admin**."
-    ),
-)
+@router.get("/reviews")
 async def list_reviews(
     status_filter: ReviewStatus = Query(ReviewStatus.pendiente),
     page: int = Query(1, ge=1),
@@ -39,31 +37,18 @@ async def list_reviews(
 ) -> dict:
     skip = (page - 1) * limit
     query = {"status": status_filter.value}
-
     total = await db.reviews_manual.count_documents(query)
     cursor = (
-        db.reviews_manual
-        .find(query)
-        .sort("created_at", 1)
-        .skip(skip)
-        .limit(limit)
+        db.reviews_manual.find(query)
+        .sort("created_at", 1).skip(skip).limit(limit)
     )
     items = await cursor.to_list(length=limit)
     for item in items:
         item["_id"] = str(item.get("_id", ""))
-
     return {"total": total, "page": page, "limit": limit, "items": items}
 
 
-@router.patch(
-    "/reviews/{event_id}",
-    summary="Aprobar o rechazar evento en revisión",
-    description=(
-        "Actualiza el estado de un evento en cola de revisión. "
-        "Si se aprueba, el evento pasa a 'publicado'. "
-        "Si se rechaza, el evento queda en 'rechazado'. **Requiere rol admin**."
-    ),
-)
+@router.patch("/reviews/{event_id}")
 async def review_event(
     event_id: str,
     action: ReviewAction,
@@ -71,28 +56,20 @@ async def review_event(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
     now = datetime.utcnow()
-
-    # Actualizar estado del evento
-    if action.action == ReviewStatus.aprobado:
-        new_event_status = EventStatus.publicado
-    else:
-        new_event_status = EventStatus.rechazado
-
+    new_event_status = (
+        EventStatus.publicado if action.action == ReviewStatus.aprobado
+        else EventStatus.rechazado
+    )
     await update_event_status(event_id, new_event_status, db)
-
-    # Actualizar documento de revisión
     await db.reviews_manual.update_one(
         {"event_id": event_id},
-        {
-            "$set": {
-                "status": action.action.value,
-                "reviewer_id": admin.user_id,
-                "notes": action.notes,
-                "reviewed_at": now,
-            }
-        },
+        {"$set": {
+            "status": action.action.value,
+            "reviewer_id": admin.user_id,
+            "notes": action.notes,
+            "reviewed_at": now,
+        }},
     )
-
     return {
         "event_id": event_id,
         "new_status": new_event_status.value,
@@ -102,12 +79,7 @@ async def review_event(
 
 # ── Creación manual de eventos ────────────────────────────────────────
 
-@router.post(
-    "/events",
-    status_code=status.HTTP_201_CREATED,
-    summary="Crear evento manualmente",
-    description="El administrador puede crear eventos directamente. Se publican de inmediato. **Requiere rol admin**.",
-)
+@router.post("/events", status_code=status.HTTP_201_CREATED)
 async def create_event(
     data: EventCreate,
     admin: TokenData = Depends(require_admin),
@@ -118,30 +90,22 @@ async def create_event(
 
 # ── Estadísticas ──────────────────────────────────────────────────────
 
-@router.get(
-    "/stats",
-    summary="Estadísticas del sistema",
-    description="Resumen del estado del sistema: eventos, usuarios, reviews. **Requiere rol admin**.",
-)
+@router.get("/stats")
 async def system_stats(
     admin: TokenData = Depends(require_admin),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
     total_events = await db.events.count_documents({})
     published = await db.events.count_documents({"status": EventStatus.publicado.value})
-    pending_review = await db.reviews_manual.count_documents({"status": ReviewStatus.pendiente.value})
     total_users = await db.users.count_documents({})
     total_interactions = await db.user_interactions.count_documents({})
 
-    # Distribución por categoría
     pipeline = [
         {"$match": {"status": EventStatus.publicado.value}},
         {"$group": {"_id": "$category", "count": {"$sum": 1}}},
     ]
     category_dist_raw = await db.events.aggregate(pipeline).to_list(20)
     category_dist = {doc["_id"]: doc["count"] for doc in category_dist_raw}
-
-    from api.models.interaction import ReviewStatus
 
     return {
         "events": {
@@ -158,27 +122,151 @@ async def system_stats(
     }
 
 
-# ── Scraper trigger (protegido con SCRAPER_CRON_SECRET) ───────────────
+# ── Helpers de jobs ───────────────────────────────────────────────────
 
-@router.post(
-    "/trigger-scraper",
-    summary="Disparar scraping manualmente",
-    description=(
-        "Ejecuta el pipeline de scraping de forma manual. "
-        "Requiere header X-Cron-Secret con el valor correcto. "
-        "**Requiere rol admin**."
-    ),
-)
+def _make_logger(job_id: str):
+    """Retorna una función log y un logging.Handler para capturar logs externos."""
+    import logging
+
+    def log(msg: str):
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        _job_logs[job_id].append(line)
+
+    class ListHandler(logging.Handler):
+        def emit(self, record):
+            _job_logs[job_id].append(
+                f"[{datetime.now().strftime('%H:%M:%S')}] {record.getMessage()}"
+            )
+
+    return log, ListHandler()
+
+
+# ── Scraper trigger con logs en tiempo real ───────────────────────────
+
+@router.post("/trigger-scraper")
 async def trigger_scraper(
     admin: TokenData = Depends(require_admin),
-    db: AsyncIOMotorDatabase = Depends(get_db),
 ) -> dict:
-    """
-    En producción esto dispararía un webhook a GitHub Actions.
-    Aquí retornamos un mensaje de confirmación.
-    """
-    return {
-        "message": "Scraping disparado. Revisa GitHub Actions para el progreso.",
-        "triggered_by": admin.user_id,
-        "triggered_at": datetime.utcnow().isoformat(),
-    }
+    job_id = str(uuid.uuid4())
+    _job_logs[job_id] = []
+    _job_status[job_id] = "running"
+
+    async def run():
+        import logging
+        log, handler = _make_logger(job_id)
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        try:
+            log("🕷️  Iniciando scraper...")
+            from scraper.scraper import run_scraper
+            stats = await run_scraper(sources=None, dry_run=False)
+            log("━" * 40)
+            log(f"✅  Scraping completado")
+            log(f"   Total recolectados : {stats.get('total', 0)}")
+            log(f"   Publicados         : {stats.get('published', 0)}")
+            log(f"   En revisión manual : {stats.get('pending_review', 0)}")
+            log(f"   Skipped            : {stats.get('skipped', 0)}")
+            log(f"   Errores            : {stats.get('errors', 0)}")
+            _job_status[job_id] = "done"
+        except Exception as exc:
+            log(f"❌  Error: {exc}")
+            _job_status[job_id] = "error"
+        finally:
+            root_logger.removeHandler(handler)
+
+    asyncio.create_task(run())
+    return {"job_id": job_id, "message": "Scraper iniciado."}
+
+
+# ── Reentrenamiento ML ────────────────────────────────────────────────
+
+@router.post("/trigger-retrain")
+async def trigger_retrain(
+    admin: TokenData = Depends(require_admin),
+) -> dict:
+    job_id = str(uuid.uuid4())
+    _job_logs[job_id] = []
+    _job_status[job_id] = "running"
+
+    async def run():
+        import logging
+        log, handler = _make_logger(job_id)
+        root_logger = logging.getLogger()
+        root_logger.addHandler(handler)
+        try:
+            log("🧠  Iniciando reentrenamiento de modelos ML...")
+            log("   Cargando dataset sintético...")
+
+            def _train():
+                from ml.training.train_models import (
+                    load_synthetic_data,
+                    train_category_classifier,
+                    train_quality_scorer,
+                    train_knn_recommender,
+                    train_svm_ranker,
+                )
+                events_df, interactions_df = load_synthetic_data()
+                models = train_category_classifier(events_df)
+                vectorizer = models["vectorizer"]
+                train_quality_scorer(events_df, vectorizer)
+                train_knn_recommender(events_df, interactions_df, vectorizer)
+                train_svm_ranker(events_df, interactions_df, vectorizer)
+
+            await asyncio.get_event_loop().run_in_executor(None, _train)
+
+            log("━" * 40)
+            log("✅  Reentrenamiento completado.")
+            log("   Modelos guardados en ml/saved_models/")
+            log("   Recarga uvicorn para aplicar los nuevos modelos.")
+            _job_status[job_id] = "done"
+        except Exception as exc:
+            log(f"❌  Error: {exc}")
+            _job_status[job_id] = "error"
+        finally:
+            root_logger.removeHandler(handler)
+
+    asyncio.create_task(run())
+    return {"job_id": job_id, "message": "Reentrenamiento iniciado."}
+
+
+# ── SSE: stream de logs por job_id ────────────────────────────────────
+
+@router.get("/logs/{job_id}")
+async def stream_logs(
+    job_id: str,
+    token: str = Query(...),
+) -> StreamingResponse:
+    # Validar token manualmente (EventSource no soporta headers)
+    try:
+        token_data = _decode_token(token)
+        if token_data.role.value != "admin":
+            from fastapi import HTTPException
+            raise HTTPException(status_code=403, detail="Se requiere rol admin.")
+    except Exception:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Token inválido.")
+
+    async def event_generator():
+        sent = 0
+        while True:
+            logs = _job_logs.get(job_id, [])
+            while sent < len(logs):
+                line = logs[sent]
+                yield f"data: {json.dumps({'line': line})}\n\n"
+                sent += 1
+
+            job_st = _job_status.get(job_id, "running")
+            if job_st in ("done", "error"):
+                yield f"data: {json.dumps({'status': job_st})}\n\n"
+                break
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
