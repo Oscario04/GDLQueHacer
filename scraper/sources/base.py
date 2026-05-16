@@ -1,10 +1,15 @@
 """
-base.py
+base.py  — v2
 Orquestador principal del scraper.
-  1. Llama a cada fuente (Eventbrite, etc.)
+  1. Llama a cada fuente (Ticketmaster, SIC, Eventbrite, etc.)
   2. Normaliza los eventos al esquema unificado
   3. Geocodifica la dirección con Nominatim si no hay coords
-  4. Guarda en MongoDB con status='recolectado' → 'normalizado'
+  4. Guarda en MongoDB con upsert (source + source_id)
+
+CAMBIOS v2:
+  - Esquema normalizado agrega `estado` y `ciudad` para filtrado en front.
+  - Geocodificación preserva `estado`/`ciudad` que vienen del raw.
+  - Sin filtros geográficos — el scraper captura TODO México.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from .eventbrite import EventbriteScraper
 
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
-NOMINATIM_HEADERS = {"User-Agent": "GDLQueHacer/1.0 (contacto@gdlquehacer.mx)"}
+NOMINATIM_HEADERS = {"User-Agent": "GDLQueHacer/2.0 (contacto@gdlquehacer.mx)"}
 
 
 # ---------------------------------------------------------------------------
@@ -55,11 +60,12 @@ def geocode(address: str) -> Optional[dict]:
 
 def normalize_event(raw: dict, source: str) -> dict:
     """
-    Convierte el dict crudo de cualquier fuente al esquema unificado:
+    Convierte el dict crudo de cualquier fuente al esquema unificado.
 
+    Esquema:
     {
-        source_id: str,          # ID original de la fuente
-        source: str,             # "eventbrite" | "manual" | ...
+        source_id: str,
+        source: str,
         title: str,
         description: str,
         category: str,
@@ -67,7 +73,7 @@ def normalize_event(raw: dict, source: str) -> dict:
         image_url: str | None,
         start_date: datetime,
         end_date: datetime | None,
-        price: float | None,     # 0.0 = gratis
+        price: float | None,
         currency: str,
         url: str,
         location: {
@@ -75,8 +81,11 @@ def normalize_event(raw: dict, source: str) -> dict:
             lat: float | None,
             lon: float | None,
         },
+        # Campos para filtrado geográfico en el front:
+        estado: str,          # "Jalisco", "CDMX", etc.
+        ciudad: str,          # "Guadalajara", "Zapopan", etc.
         status: "normalizado",
-        quality_ml: None,        # se calcula después por el clasificador
+        quality_ml: None,
         created_at: datetime,
         updated_at: datetime,
     }
@@ -84,43 +93,49 @@ def normalize_event(raw: dict, source: str) -> dict:
     now = datetime.now(timezone.utc)
 
     location = raw.get("location", {})
-    lat = location.get("lat")
-    lon = location.get("lon")
-    address = location.get("address", "")
+    lat = raw.get("latitude") or location.get("lat")
+    lon = raw.get("longitude") or location.get("lon")
+    address = raw.get("location") if isinstance(raw.get("location"), str) else location.get("address", "")
 
-    # Geocodificar si faltan coordenadas
-    if address and (lat is None or lon is None):
-        coords = geocode(f"{address}, Guadalajara, Mexico")
+    # Geocodificar si faltan coordenadas y hay dirección
+    if address and isinstance(address, str) and (lat is None or lon is None):
+        coords = geocode(f"{address}, México")
         if coords:
             lat, lon = coords["lat"], coords["lon"]
 
+    # Campos de ubicación estructurada (vienen de scrapers que los separan)
+    estado = (raw.get("estado") or "").strip()
+    ciudad = (raw.get("ciudad") or "").strip()
+
     return {
-        "source_id": str(raw.get("source_id", "")),
-        "source": source,
-        "title": (raw.get("title") or "").strip(),
+        "source_id":   str(raw.get("source_id", "") or raw.get("external_id", "")),
+        "source":      source,
+        "title":       (raw.get("title") or "").strip(),
         "description": (raw.get("description") or "").strip(),
-        "category": (raw.get("category") or "").strip(),
-        "tags": raw.get("tags", []),
-        "image_url": raw.get("image_url"),
-        "start_date": raw.get("start_date"),
-        "end_date": raw.get("end_date"),
-        "price": raw.get("price"),
-        "currency": raw.get("currency", "MXN"),
-        "url": raw.get("url", ""),
+        "category":    (raw.get("category") or "").strip(),
+        "tags":        raw.get("tags", []),
+        "image_url":   raw.get("image_url"),
+        "start_date":  raw.get("date_start") or raw.get("start_date"),
+        "end_date":    raw.get("date_end") or raw.get("end_date"),
+        "price":       raw.get("price"),
+        "currency":    raw.get("currency", "MXN"),
+        "url":         raw.get("url", ""),
         "location": {
-            "address": address,
-            "lat": lat,
-            "lon": lon,
+            "address": address if isinstance(address, str) else "",
+            "lat":     float(lat) if lat is not None else None,
+            "lon":     float(lon) if lon is not None else None,
         },
-        "status": "normalizado",
-        "quality_ml": None,
-        "created_at": now,
-        "updated_at": now,
+        "estado":      estado,
+        "ciudad":      ciudad,
+        "status":      "normalizado",
+        "quality_ml":  None,
+        "created_at":  now,
+        "updated_at":  now,
     }
 
 
 # ---------------------------------------------------------------------------
-# Guardado en MongoDB (upsert por source + source_id)
+# Guardado en MongoDB
 # ---------------------------------------------------------------------------
 
 def save_events(events: list[dict]) -> None:
@@ -151,14 +166,13 @@ def save_events(events: list[dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Orquestador
+# Orquestador (versión sync legacy — usa scraper.py para el async completo)
 # ---------------------------------------------------------------------------
 
 def run_all_scrapers() -> None:
     token = os.environ.get("EVENTBRITE_TOKEN", "")
     all_events: list[dict] = []
 
-    # ── Eventbrite ──
     print("[scraper] Iniciando Eventbrite…")
     try:
         eb = EventbriteScraper(token=token)
@@ -169,10 +183,6 @@ def run_all_scrapers() -> None:
         print(f"[scraper] Eventbrite: {len(raw_events)} eventos obtenidos")
     except Exception as exc:
         print(f"[scraper] Error Eventbrite: {exc}")
-
-    # ── Aquí puedes agregar más scrapers en el futuro ──
-    # from .otra_fuente import OtraFuenteScraper
-    # ...
 
     print(f"[scraper] Total eventos a guardar: {len(all_events)}")
     if all_events:

@@ -5,18 +5,22 @@ on:
     - cron: "0 */6 * * *"   # cada 6 horas
   workflow_dispatch:          # también se puede lanzar manualmente
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true   # opt-in a Node.js 24 ya
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2          # última versión con soporte Node 24
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.6.0      # última versión con soporte Node 24
         with:
           python-version: "3.11"
+          cache: "pip"                          # cachea dependencias para correr más rápido
 
       - name: Install dependencies
         run: |
@@ -26,8 +30,9 @@ jobs:
         env:
           MONGODB_URI: ${{ secrets.MONGODB_URI }}
           EVENTBRITE_TOKEN: ${{ secrets.EVENTBRITE_TOKEN }}
+          TICKETMASTER_API_KEY: ${{ secrets.TICKETMASTER_API_KEY }}
         run: |
-          python -m scraper.base
+          python -m scraper.scraper
 
       - name: Run ML pipeline
         env:

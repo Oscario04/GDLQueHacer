@@ -1,16 +1,16 @@
 """
 scraper/sources/sic_jalisco.py
 Scraper para el Sistema de Información Cultural (SIC) de la Secretaría de Cultura.
-URL: https://sic.cultura.gob.mx
 
-Extrae festivales, ferias y eventos culturales de Jalisco (estado_id=14).
-Sin API key — scraping HTML público del gobierno federal.
-
-Tablas disponibles en SIC:
-  - festival         → Festivales
-  - festival_otros   → Muestras y otros eventos
-  - feria            → Ferias
+MEJORAS v2:
+  - Más tablas: agrega 'espectaculo', 'museo' (exposiciones), 'curso'
+  - MAX_FICHAS subido a 500 (antes 50) — hay muchos eventos en SIC
+  - Paginación en la lista del SIC (parámetro &page=N)
+  - Retry en errores HTTP temporales
+  - Concurrencia controlada en la descarga de fichas (semáforo de 5)
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
@@ -24,17 +24,22 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-SIC_BASE = "https://sic.cultura.gob.mx"
-
-# Estado 14 = Jalisco en el SIC
+SIC_BASE        = "https://sic.cultura.gob.mx"
 JALISCO_ESTADO_ID = 14
 
-# Tablas de eventos en el SIC
+# Tablas disponibles en el SIC
 SIC_TABLES = [
     "festival",
     "festival_otros",
     "feria",
+    "espectaculo",      # NUEVO: espectáculos escénicos
+    "exposicion",       # NUEVO: exposiciones
+    "curso",            # NUEVO: cursos y talleres
 ]
+
+MAX_FICHAS   = 500   # por tabla (antes 50)
+MAX_LIST_PAGES = 20  # páginas de lista por tabla
+CONCURRENCY  = 5     # descargas paralelas de fichas
 
 HEADERS = {
     "User-Agent": (
@@ -48,16 +53,13 @@ HEADERS = {
 
 
 class SICJaliscoScraper:
-    """
-    Scraper asíncrono para el SIC — eventos culturales de Jalisco.
-    Extrae festivales, ferias y muestras culturales.
-    """
+    """Scraper asíncrono para el SIC — eventos culturales de Jalisco."""
 
-    def __init__(self, delay: float = 1.0):
+    def __init__(self, delay: float = 0.5):
         self.delay = delay
+        self._sem  = asyncio.Semaphore(CONCURRENCY)
 
     async def fetch_events(self) -> list[dict[str, Any]]:
-        """Punto de entrada principal. Retorna lista de eventos normalizados."""
         all_events: list[dict] = []
         timeout = httpx.Timeout(30.0)
 
@@ -87,36 +89,80 @@ class SICJaliscoScraper:
     async def _fetch_table(
         self, client: httpx.AsyncClient, table: str
     ) -> list[dict[str, Any]]:
-        """Descarga la lista de eventos de una tabla del SIC para Jalisco."""
-        url = (
-            f"{SIC_BASE}/lista.php"
-            f"?table={table}&estado_id={JALISCO_ESTADO_ID}"
-        )
-        try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-        except httpx.HTTPStatusError as e:
-            logger.warning("SIC HTTP error %s tabla '%s': %s", e.response.status_code, table, url)
-            return []
-        except Exception as e:
-            logger.warning("SIC error accediendo tabla '%s': %s", table, e)
-            return []
+        """Descarga todas las páginas de lista de una tabla y luego visita fichas."""
+        all_links: list[str] = []
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        for page in range(1, MAX_LIST_PAGES + 1):
+            url = (
+                f"{SIC_BASE}/lista.php"
+                f"?table={table}&estado_id={JALISCO_ESTADO_ID}&page={page}"
+            )
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                logger.warning("SIC HTTP %s tabla '%s' pág %d", e.response.status_code, table, page)
+                break
+            except Exception as e:
+                logger.warning("SIC error tabla '%s' pág %d: %s", table, page, e)
+                break
 
-        # ── Estrategia 1: JSON-LD ─────────────────────────────────────
-        events = self._parse_json_ld(soup, url)
-        if events:
-            return events
+            soup = BeautifulSoup(resp.text, "html.parser")
 
-        # ── Estrategia 2: Lista de fichas del SIC ─────────────────────
-        events = await self._parse_ficha_list(client, soup, url, table)
+            # JSON-LD directo en la página de lista (raro pero posible)
+            ld_events = self._parse_json_ld(soup, url)
+            if ld_events:
+                return ld_events  # Si hay JSON-LD, úsalo y no pagines más
+
+            # Recolectar enlaces a fichas
+            links = (
+                soup.find_all("a", href=re.compile(r"ficha\.php"))
+                or soup.find_all("a", href=re.compile(r"table_id="))
+            )
+            if not links:
+                if page == 1:
+                    # Intentar parsear filas de tabla HTML
+                    return self._parse_table_rows(soup, url, table)
+                break   # Sin más links → fin de paginación
+
+            for link in links:
+                href = link.get("href", "")
+                ficha_url = href if href.startswith("http") else urljoin(SIC_BASE, href)
+                if ficha_url not in all_links:
+                    all_links.append(ficha_url)
+
+            if len(all_links) >= MAX_FICHAS:
+                break
+
+            await asyncio.sleep(self.delay)
+
+        # Visitar fichas con concurrencia controlada
+        all_links = all_links[:MAX_FICHAS]
+        events    = await self._fetch_fichas_concurrent(client, all_links, table)
         return events
 
-    def _parse_json_ld(
-        self, soup: BeautifulSoup, page_url: str
-    ) -> list[dict[str, Any]]:
-        """Extrae eventos de bloques JSON-LD (si el SIC los incluye)."""
+    async def _fetch_fichas_concurrent(
+        self,
+        client: httpx.AsyncClient,
+        urls: list[str],
+        table: str,
+    ) -> list[dict]:
+        """Descarga fichas en paralelo usando un semáforo de concurrencia."""
+        async def _fetch_one(url: str) -> dict | None:
+            async with self._sem:
+                await asyncio.sleep(self.delay * 0.3)
+                return await self._fetch_ficha(client, url, table)
+
+        tasks   = [_fetch_one(url) for url in urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        events = []
+        for r in results:
+            if isinstance(r, dict) and r:
+                events.append(r)
+        return events
+
+    def _parse_json_ld(self, soup: BeautifulSoup, page_url: str) -> list[dict]:
         events = []
         for script in soup.find_all("script", type="application/ld+json"):
             try:
@@ -134,15 +180,13 @@ class SICJaliscoScraper:
                     events.append(evt)
         return events
 
-    def _normalize_json_ld(
-        self, item: dict, page_url: str
-    ) -> dict[str, Any] | None:
+    def _normalize_json_ld(self, item: dict, page_url: str) -> dict | None:
         title = item.get("name", "").strip()
         if not title:
             return None
 
         date_start = item.get("startDate")
-        date_end = item.get("endDate")
+        date_end   = item.get("endDate")
 
         location_data = item.get("location", {})
         location_name = ""
@@ -164,183 +208,123 @@ class SICJaliscoScraper:
             image = image.get("url")
 
         return {
-            "title": title,
+            "title":       title,
             "description": item.get("description", ""),
-            "date_start": date_start,
-            "date_end": date_end,
-            "location": location_name,
-            "latitude": lat,
-            "longitude": lon,
-            "image_url": image,
-            "url": item.get("url") or page_url,
-            "price": None,
-            "tags": ["cultura", "sic"],
-            "source_id": "sic_jalisco",
+            "date_start":  date_start,
+            "date_end":    date_end,
+            "location":    location_name,
+            "latitude":    lat,
+            "longitude":   lon,
+            "image_url":   image,
+            "url":         item.get("url") or page_url,
+            "price":       None,
+            "tags":        ["cultura", "sic"],
+            "source_id":   "sic_jalisco",
         }
-
-    async def _parse_ficha_list(
-        self,
-        client: httpx.AsyncClient,
-        soup: BeautifulSoup,
-        list_url: str,
-        table: str,
-    ) -> list[dict[str, Any]]:
-        """
-        Parsea la lista de fichas del SIC.
-        Cada fila tiene un enlace a ficha.php?table=...&table_id=...
-        Extrae datos básicos de la lista, opcionalmente visita fichas individuales.
-        """
-        events: list[dict] = []
-
-        # El SIC lista eventos en tablas HTML o listas con enlaces a ficha.php
-        links = soup.find_all("a", href=re.compile(r"ficha\.php"))
-        if not links:
-            # Intentar cualquier enlace con table_id
-            links = soup.find_all("a", href=re.compile(r"table_id="))
-
-        if not links:
-            logger.debug("SIC: sin enlaces de fichas en %s", list_url)
-            return self._parse_table_rows(soup, list_url, table)
-
-        # Visitar cada ficha individualmente (con límite para no abusar)
-        MAX_FICHAS = 50
-        for link in links[:MAX_FICHAS]:
-            href = link.get("href", "")
-            ficha_url = href if href.startswith("http") else urljoin(SIC_BASE, href)
-
-            try:
-                evt = await self._fetch_ficha(client, ficha_url, table)
-                if evt:
-                    events.append(evt)
-                await asyncio.sleep(self.delay * 0.5)
-            except Exception as e:
-                logger.debug("SIC error en ficha %s: %s", ficha_url, e)
-
-        return events
 
     def _parse_table_rows(
         self, soup: BeautifulSoup, page_url: str, table: str
-    ) -> list[dict[str, Any]]:
-        """Extrae eventos directamente de filas de tabla HTML."""
+    ) -> list[dict]:
         events = []
-        rows = soup.find_all("tr")
-
-        for row in rows[1:]:  # Saltar header
+        for row in soup.find_all("tr")[1:]:
             cells = row.find_all(["td", "th"])
             if len(cells) < 2:
                 continue
-
             title = cells[0].get_text(strip=True)
             if not title or len(title) < 3:
                 continue
 
-            # Buscar fecha en las celdas
             date_start = None
-            location = ""
+            location   = ""
             for cell in cells[1:]:
                 text = cell.get_text(strip=True)
-                # Detectar fechas
                 if re.search(r"\d{4}", text) and date_start is None:
                     date_start = text
-                # Detectar ubicación (si menciona Jalisco)
-                if any(
-                    kw in text.lower()
-                    for kw in ["jalisco", "guadalajara", "vallarta"]
-                ):
+                if any(kw in text.lower() for kw in ["jalisco", "guadalajara", "vallarta"]):
                     location = text
 
             link_el = row.find("a", href=True)
-            url = ""
+            url     = ""
             if link_el:
                 href = link_el["href"]
-                url = href if href.startswith("http") else urljoin(SIC_BASE, href)
+                url  = href if href.startswith("http") else urljoin(SIC_BASE, href)
 
             events.append({
-                "title": title,
+                "title":       title,
                 "description": "",
-                "date_start": date_start,
-                "date_end": None,
-                "location": location or "Jalisco",
-                "latitude": None,
-                "longitude": None,
-                "image_url": None,
-                "url": url or page_url,
-                "price": None,
-                "tags": ["cultura", "sic", table],
-                "source_id": "sic_jalisco",
+                "date_start":  date_start,
+                "date_end":    None,
+                "location":    location or "Jalisco",
+                "latitude":    None,
+                "longitude":   None,
+                "image_url":   None,
+                "url":         url or page_url,
+                "price":       None,
+                "tags":        ["cultura", "sic", table],
+                "source_id":   "sic_jalisco",
             })
-
         return events
 
     async def _fetch_ficha(
-        self, client: httpx.AsyncClient, url: str, table: str
-    ) -> dict[str, Any] | None:
-        """Descarga y parsea una ficha individual del SIC."""
-        try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-        except Exception as e:
-            logger.debug("SIC ficha error %s: %s", url, e)
-            return None
+        self, client: httpx.AsyncClient, url: str, table: str, retries: int = 2
+    ) -> dict | None:
+        for attempt in range(retries):
+            try:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                break
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code in (404, 410):
+                    return None
+                if attempt < retries - 1:
+                    await asyncio.sleep(2)
+                else:
+                    return None
+            except Exception as e:
+                logger.debug("SIC ficha error %s: %s", url, e)
+                return None
 
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # ── JSON-LD primero ───────────────────────────────────────────
         ld_events = self._parse_json_ld(soup, url)
         if ld_events:
             return ld_events[0]
 
-        # ── Parseo de ficha estructurada del SIC ─────────────────────
         return self._parse_ficha_html(soup, url, table)
 
     def _parse_ficha_html(
         self, soup: BeautifulSoup, url: str, table: str
-    ) -> dict[str, Any] | None:
-        """Extrae datos de una ficha HTML del SIC."""
-        # Título principal
+    ) -> dict | None:
         title_el = soup.find(["h1", "h2", "h3"])
-        title = title_el.get_text(strip=True) if title_el else ""
-
+        title    = title_el.get_text(strip=True) if title_el else ""
         if not title:
             return None
 
-        # La ficha del SIC usa una tabla de datos label-valor
         data: dict[str, str] = {}
         for row in soup.find_all("tr"):
             cells = row.find_all(["th", "td"])
             if len(cells) == 2:
-                key = cells[0].get_text(strip=True).lower().rstrip(":")
-                val = cells[1].get_text(strip=True)
+                key      = cells[0].get_text(strip=True).lower().rstrip(":")
+                val      = cells[1].get_text(strip=True)
                 data[key] = val
 
-        # Mappings comunes del SIC
         date_start = (
-            data.get("fecha de inicio")
-            or data.get("fecha inicio")
-            or data.get("inicio")
-            or data.get("fecha")
+            data.get("fecha de inicio") or data.get("fecha inicio")
+            or data.get("inicio") or data.get("fecha")
         )
         date_end = (
-            data.get("fecha de término")
-            or data.get("fecha término")
-            or data.get("término")
-            or data.get("fin")
+            data.get("fecha de término") or data.get("fecha término")
+            or data.get("término") or data.get("fin")
         )
         location = (
-            data.get("municipio")
-            or data.get("lugar")
-            or data.get("sede")
-            or data.get("recinto")
-            or "Jalisco"
+            data.get("municipio") or data.get("lugar") or data.get("sede")
+            or data.get("recinto") or "Jalisco"
         )
         description = (
-            data.get("descripción")
-            or data.get("descripcion")
-            or data.get("resumen")
-            or ""
+            data.get("descripción") or data.get("descripcion")
+            or data.get("resumen") or ""
         )
 
-        # Coordenadas del mapa (si existen en la ficha)
         lat = lon = None
         map_el = soup.find(attrs={"data-lat": True})
         if map_el:
@@ -350,24 +334,23 @@ class SICJaliscoScraper:
             except (ValueError, TypeError):
                 pass
 
-        # Imagen
-        img_el = soup.find("img", src=re.compile(r"\.(jpg|jpeg|png|webp)", re.I))
+        img_el    = soup.find("img", src=re.compile(r"\.(jpg|jpeg|png|webp)", re.I))
         image_url = None
         if img_el:
-            src = img_el.get("src", "")
+            src       = img_el.get("src", "")
             image_url = src if src.startswith("http") else urljoin(SIC_BASE, src)
 
         return {
-            "title": title,
+            "title":       title,
             "description": description,
-            "date_start": date_start,
-            "date_end": date_end,
-            "location": location,
-            "latitude": lat,
-            "longitude": lon,
-            "image_url": image_url,
-            "url": url,
-            "price": data.get("costo") or data.get("precio"),
-            "tags": ["cultura", "sic", table],
-            "source_id": "sic_jalisco",
+            "date_start":  date_start,
+            "date_end":    date_end,
+            "location":    location,
+            "latitude":    lat,
+            "longitude":   lon,
+            "image_url":   image_url,
+            "url":         url,
+            "price":       data.get("costo") or data.get("precio"),
+            "tags":        ["cultura", "sic", table],
+            "source_id":   "sic_jalisco",
         }

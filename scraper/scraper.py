@@ -1,26 +1,30 @@
 """
-scraper/scraper.py
-Motor de scraping para GDL Qué Hacer.
-Ejecutado por GitHub Actions cada 6 horas.
+scraper/scraper.py  — v6
+Motor de scraping para GDL Qué Hacer — cobertura nacional completa.
 
-Fuentes:
-  1. Ticketmaster GDL  — ciudad Guadalajara (rápido, pocos resultados)
-  2. Ticketmaster JAL  — todo Jalisco por geopoint + multi-ciudad (NUEVO)
-  3. Boletia           — plataforma MX de tickets, scraping HTML (NUEVO)
-  4. SIC Jalisco       — Sistema de Información Cultural, eventos culturales (NUEVO)
-  5. Eventbrite        — requiere EVENTBRITE_TOKEN en .env
-  6. Sitios locales GDL— sin API key (JSON-LD + HTML scraping)
+Fuentes activas (objetivo: 5,000–10,000 eventos):
+  1.  Ticketmaster Nacional v2  — 50+ ciudades + 25 geo + géneros   → ~3,000
+  2.  Ticketmaster Jalisco      — multi-radio + segmentos (legacy)   → ~500
+  3.  Eventbrite Nacional v2    — 25 geo + 50 queries + categorías   → ~1,500
+  4.  Songkick                  — ★ NUEVO: 20 metro areas México      → ~500
+  5.  Fuentes Nacionales        — ★ NUEVO: CDMX, INBA, UNAM, etc.   → ~800
+  6.  SIC HTML                  — scraper HTML original              → ~300
+  7.  SIC API REST              — API REST oficial del SIC           → ~400
+  8.  SIC Datos Abiertos        — CSVs abiertos del SIC             → ~300
+  9.  datos.gob.mx              — datasets CKAN del gobierno         → ~200
+  10. GDL Nuevas Fuentes        — Meetup, AllEvents, Superboletos    → ~300
+  11. GDL Local                 — sitios locales (ITESO, UdeG, etc.) → ~200
+
+Total estimado: 5,000-10,000 eventos únicos.
 
 Uso:
-    python -m scraper.scraper                           # todas las fuentes
-    python -m scraper.scraper --source ticketmaster
-    python -m scraper.scraper --source ticketmaster_jalisco
-    python -m scraper.scraper --source boletia
-    python -m scraper.scraper --source sic
-    python -m scraper.scraper --source eventbrite
-    python -m scraper.scraper --source local
-    python -m scraper.scraper --source ticketmaster boletia sic
-    python -m scraper.scraper --dry-run               # sin guardar en BD
+    python -m scraper.scraper                                # todas las fuentes
+    python -m scraper.scraper --source ticketmaster_nacional
+    python -m scraper.scraper --source eventbrite_nacional
+    python -m scraper.scraper --source songkick
+    python -m scraper.scraper --source fuentes_nacionales
+    python -m scraper.scraper --dry-run
+    python -m scraper.scraper --setup-db     # crear índices MongoDB
 """
 import asyncio
 import argparse
@@ -30,7 +34,6 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Cargar .env ANTES de cualquier import de api/ml ──────────────────
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -43,13 +46,20 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# Fuentes disponibles (para --source choices)
 ALL_SOURCES = [
-    "ticketmaster",
+    "ticketmaster_nacional",
     "ticketmaster_jalisco",
-    "boletia",
-    "sic",
+    "eventbrite_nacional",
     "eventbrite",
+    "songkick",              # ★ nuevo
+    "fuentes_nacionales",    # ★ nuevo
+    "sic",
+    "sic_api",
+    "ticketmaster_latam",
+    "sic_datos_abiertos",
+    "massive_scraper",
+    "datos_gob_mx",
+    "nuevas",
     "local",
     "all",
 ]
@@ -59,16 +69,6 @@ async def run_scraper(
     sources: list[str] | None = None,
     dry_run: bool = False,
 ) -> dict:
-    """
-    Ejecuta los scrapers configurados e ingesta los eventos en MongoDB.
-
-    Args:
-        sources: Lista de fuentes a usar. None = todas.
-        dry_run: Si True, procesa eventos pero NO guarda en BD.
-
-    Returns:
-        Estadísticas del proceso.
-    """
     from ml.pipeline import ingest_events
 
     eventbrite_token = os.getenv("EVENTBRITE_TOKEN")
@@ -77,167 +77,240 @@ async def run_scraper(
     run_all = not sources or "all" in sources
     all_raw_events: list[dict] = []
 
-    # ── 1. Ticketmaster GDL (original, rápido) ────────────────────────
-    if run_all or "ticketmaster" in sources:
+    # ── 1. Ticketmaster Nacional v2 ───────────────────────────────────
+    if run_all or "ticketmaster_nacional" in (sources or []):
         if not ticketmaster_key:
-            logger.warning("TICKETMASTER_API_KEY no configurada. Saltando Ticketmaster.")
+            logger.warning("TICKETMASTER_API_KEY no configurada.")
         else:
             try:
-                from scraper.sources.ticketmaster import TicketmasterScraper
-                scraper = TicketmasterScraper(api_key=ticketmaster_key)
+                from scraper.sources.ticketmaster_nacional import TicketmasterNacionalScraper
+                scraper = TicketmasterNacionalScraper(api_key=ticketmaster_key)
                 events = await scraper.fetch_events()
                 all_raw_events.extend(events)
-                logger.info("✅  Ticketmaster GDL: %d eventos obtenidos", len(events))
+                logger.info("✅  Ticketmaster Nacional: %d eventos", len(events))
             except Exception as exc:
-                logger.error("❌  Error en Ticketmaster GDL: %s", exc)
+                logger.error("❌  Ticketmaster Nacional: %s", exc)
 
-    # ── 2. Ticketmaster Jalisco (expandido, todo el estado) ───────────
-    if run_all or "ticketmaster_jalisco" in sources:
+    # ── 2. Ticketmaster Jalisco (legacy) ─────────────────────────────
+    if run_all or "ticketmaster_jalisco" in (sources or []):
         if not ticketmaster_key:
-            logger.warning("TICKETMASTER_API_KEY no configurada. Saltando TM Jalisco.")
+            logger.warning("TICKETMASTER_API_KEY no configurada.")
         else:
             try:
                 from scraper.sources.ticketmaster_jalisco import TicketmasterJaliscoScraper
                 scraper = TicketmasterJaliscoScraper(api_key=ticketmaster_key)
                 events = await scraper.fetch_events()
                 all_raw_events.extend(events)
-                logger.info("✅  Ticketmaster Jalisco: %d eventos obtenidos", len(events))
+                logger.info("✅  Ticketmaster Jalisco: %d eventos", len(events))
             except Exception as exc:
-                logger.error("❌  Error en Ticketmaster Jalisco: %s", exc)
+                logger.error("❌  Ticketmaster Jalisco: %s", exc)
 
-    # ── 3. Boletia ────────────────────────────────────────────────────
-    if run_all or "boletia" in sources:
-        try:
-            from scraper.sources.boletia import BoletiaScraper
-            scraper = BoletiaScraper()
-            events = await scraper.fetch_events()
-            all_raw_events.extend(events)
-            logger.info("✅  Boletia: %d eventos obtenidos", len(events))
-        except Exception as exc:
-            logger.error("❌  Error en Boletia: %s", exc)
-
-    # ── 4. SIC Jalisco ────────────────────────────────────────────────
-    if run_all or "sic" in sources:
-        try:
-            from scraper.sources.sic_jalisco import SICJaliscoScraper
-            scraper = SICJaliscoScraper()
-            events = await scraper.fetch_events()
-            all_raw_events.extend(events)
-            logger.info("✅  SIC Jalisco: %d eventos obtenidos", len(events))
-        except Exception as exc:
-            logger.error("❌  Error en SIC Jalisco: %s", exc)
-
-    # ── 5. Eventbrite ─────────────────────────────────────────────────
-    if run_all or "eventbrite" in sources:
+    # ── 3. Eventbrite Nacional v2 ─────────────────────────────────────
+    if run_all or "eventbrite_nacional" in (sources or []):
         if not eventbrite_token:
-            logger.warning("EVENTBRITE_TOKEN no configurado. Saltando Eventbrite.")
+            logger.warning("EVENTBRITE_TOKEN no configurado.")
+        else:
+            try:
+                from scraper.sources.eventbrite_nacional import EventbriteNacionalScraper
+                scraper = EventbriteNacionalScraper(token=eventbrite_token)
+                events = await scraper.fetch_events()
+                all_raw_events.extend(events)
+                logger.info("✅  Eventbrite Nacional: %d eventos", len(events))
+            except Exception as exc:
+                logger.error("❌  Eventbrite Nacional: %s", exc)
+
+    # ── 4. Eventbrite GDL (legacy, solo si se pide explícitamente) ────
+    if "eventbrite" in (sources or []):
+        if not eventbrite_token:
+            logger.warning("EVENTBRITE_TOKEN no configurado.")
         else:
             try:
                 from scraper.sources.eventbrite import EventbriteScraper
                 scraper = EventbriteScraper(token=eventbrite_token)
                 events = await scraper.fetch_events()
                 all_raw_events.extend(events)
-                logger.info("✅  Eventbrite: %d eventos obtenidos", len(events))
+                logger.info("✅  Eventbrite GDL: %d eventos", len(events))
             except Exception as exc:
-                logger.error("❌  Error en Eventbrite: %s", exc)
+                logger.error("❌  Eventbrite GDL: %s", exc)
 
-    # ── 6. Sitios locales GDL ─────────────────────────────────────────
-    if run_all or "local" in sources:
+    # ── 5. Songkick ★ ─────────────────────────────────────────────────
+    if run_all or "songkick" in (sources or []):
+        try:
+            from scraper.sources.songkick import SongkickScraper
+            scraper = SongkickScraper()
+            events = await scraper.fetch_events()
+            all_raw_events.extend(events)
+            logger.info("✅  Songkick: %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  Songkick: %s", exc)
+
+    # ── 6. Fuentes Nacionales ★ ───────────────────────────────────────
+    if run_all or "fuentes_nacionales" in (sources or []):
+        try:
+            from scraper.sources.fuentes_nacionales import FuentesNacionalesScraper
+            scraper = FuentesNacionalesScraper()
+            events = await scraper.fetch_all()
+            all_raw_events.extend(events)
+            logger.info("✅  Fuentes Nacionales: %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  Fuentes Nacionales: %s", exc)
+
+    # ── 7. SIC Jalisco (HTML) ─────────────────────────────────────────
+    if run_all or "sic" in (sources or []):
+        try:
+            from scraper.sources.sic_jalisco import SICJaliscoScraper
+            scraper = SICJaliscoScraper()
+            events = await scraper.fetch_events()
+            all_raw_events.extend(events)
+            logger.info("✅  SIC Jalisco (HTML): %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  SIC Jalisco (HTML): %s", exc)
+
+    # ── 8. SIC API REST ───────────────────────────────────────────────
+    if run_all or "sic_api" in (sources or []):
+        try:
+            from scraper.sources.sic_api import SICAPIScaper
+            scraper = SICAPIScaper()
+            events = await scraper.fetch_events()
+            all_raw_events.extend(events)
+            logger.info("✅  SIC API REST: %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  SIC API REST: %s", exc)
+
+    # ── 9. SIC Datos Abiertos ─────────────────────────────────────────
+    if run_all or "sic_datos_abiertos" in (sources or []):
+        try:
+            from scraper.sources.sic_datos_abiertos import SICDatosAbiertos
+            scraper = SICDatosAbiertos()
+            events = await scraper.fetch_events()
+            all_raw_events.extend(events)
+            logger.info("✅  SIC Datos Abiertos: %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  SIC Datos Abiertos: %s", exc)
+
+    # ── 10. datos.gob.mx CKAN ─────────────────────────────────────────
+    if run_all or "datos_gob_mx" in (sources or []):
+        try:
+            from scraper.sources.datos_gob_mx import DatosGobMxScraper
+            scraper = DatosGobMxScraper()
+            events = await scraper.fetch_events()
+            all_raw_events.extend(events)
+            logger.info("✅  datos.gob.mx: %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  datos.gob.mx: %s", exc)
+
+    # ── 11. GDL Nuevas Fuentes ────────────────────────────────────────
+    if run_all or "nuevas" in (sources or []):
+        try:
+            from scraper.sources.gdl_nuevas_fuentes import GDLNuevasFuentesScraper
+            scraper = GDLNuevasFuentesScraper()
+            events = await scraper.fetch_all()
+            all_raw_events.extend(events)
+            logger.info("✅  GDL Nuevas Fuentes: %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  GDL Nuevas Fuentes: %s", exc)
+
+    # ── 12. GDL Local ─────────────────────────────────────────────────
+    if run_all or "local" in (sources or []):
         try:
             from scraper.sources.gdl_local import GDLLocalScraper
             scraper = GDLLocalScraper()
             events = await scraper.fetch_all()
             all_raw_events.extend(events)
-            logger.info("✅  GDL Local: %d eventos obtenidos", len(events))
+            logger.info("✅  GDL Local: %d eventos", len(events))
         except Exception as exc:
-            logger.error("❌  Error en GDL Local: %s", exc)
+            logger.error("❌  GDL Local: %s", exc)
 
-    # ── Resumen de recolección ────────────────────────────────────────
-    logger.info("━" * 50)
-    logger.info("📦  Total eventos recolectados: %d", len(all_raw_events))
+    # ── Resumen bruto ─────────────────────────────────────────────────
+    logger.info("━" * 60)
+    logger.info("📦  Total bruto recolectado: %d eventos", len(all_raw_events))
 
     if not all_raw_events:
-        logger.info("Sin eventos nuevos. Finalizando.")
+        logger.info("Sin eventos nuevos.")
         return {"total": 0, "published": 0, "pending_review": 0, "skipped": 0, "errors": 0}
 
-    # ── Modo dry-run: solo mostrar muestra, no guardar ────────────────
+    # ── Deduplicación en memoria (fingerprint SHA-256) ─────────────────
+    try:
+        from scraper.pipelines.deduplicate import deduplicate_events
+        all_raw_events, dupes = deduplicate_events(all_raw_events)
+        logger.info(
+            "🔁  Deduplicación: %d únicos (%d eliminados)",
+            len(all_raw_events), dupes,
+        )
+    except Exception as exc:
+        logger.warning("Deduplicación falló, continuando: %s", exc)
+
+    logger.info("📊  Total después de deduplicar: %d eventos", len(all_raw_events))
+
     if dry_run:
-        logger.info("🔍  Modo dry-run: mostrando muestra de eventos...")
-        for i, evt in enumerate(all_raw_events[:5]):
+        logger.info("🔍  Dry-run — muestra de los primeros 10:")
+        for i, evt in enumerate(all_raw_events[:10]):
             logger.info(
-                "  [%d] %s | fuente=%s | fecha=%s",
+                "  [%d] %s | fuente=%-20s | fecha=%s",
                 i + 1,
-                evt.get("title", "Sin título")[:60],
+                evt.get("title", "Sin título")[:50],
                 evt.get("source_id", "?"),
-                evt.get("date_start", "?"),
+                str(evt.get("date_start", "?"))[:10],
             )
-        if len(all_raw_events) > 5:
-            logger.info("  ... y %d eventos más", len(all_raw_events) - 5)
+        if len(all_raw_events) > 10:
+            logger.info("  … y %d eventos más", len(all_raw_events) - 10)
         return {"total": len(all_raw_events), "dry_run": True}
 
-    # ── Conectar a MongoDB ────────────────────────────────────────────
+    # ── Ingestión en MongoDB ───────────────────────────────────────────
     from api.config.database import connect_db, get_db
     await connect_db()
     db = get_db()
 
-    # ── Cargar modelos ML antes de ingestar ───────────────────────────
     from api.services.ml_service import load_ml_models
     load_ml_models()
 
-    # ── Ingestión en MongoDB ──────────────────────────────────────────
-    logger.info("📥  Iniciando ingestión en MongoDB...")
+    logger.info("📥  Ingestando en MongoDB…")
     stats = await ingest_events(all_raw_events, db)
 
-    logger.info("━" * 50)
-    logger.info("✅  Scraping completado:")
-    logger.info("   Total recolectados : %d", stats["total"])
-    logger.info("   Publicados         : %d", stats["published"])
-    logger.info("   En revisión manual : %d", stats["pending_review"])
-    logger.info("   Skipped (duplicado): %d", stats["skipped"])
-    logger.info("   Errores            : %d", stats["errors"])
-    logger.info("━" * 50)
-
+    logger.info("━" * 60)
+    logger.info(
+        "✅  Completado: total=%d pub=%d rev=%d skip=%d err=%d",
+        stats["total"], stats["published"], stats["pending_review"],
+        stats["skipped"], stats["errors"],
+    )
+    logger.info("━" * 60)
     return stats
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Scraper de GDL Qué Hacer",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Ejemplos:
-  python -m scraper.scraper                              # todas las fuentes
-  python -m scraper.scraper --source ticketmaster        # solo TM ciudad GDL
-  python -m scraper.scraper --source ticketmaster_jalisco # todo Jalisco
-  python -m scraper.scraper --source boletia             # solo Boletia
-  python -m scraper.scraper --source sic                 # solo SIC cultural
-  python -m scraper.scraper --source boletia sic ticketmaster_jalisco
-  python -m scraper.scraper --dry-run                    # sin guardar en BD
-        """,
-    )
+    parser = argparse.ArgumentParser(description="Scraper GDL Qué Hacer v6")
     parser.add_argument(
         "--source",
         nargs="+",
         choices=ALL_SOURCES,
         default=["all"],
-        help="Fuentes a scrapear (default: all)",
+        help="Fuentes a ejecutar (default: todas)",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Ejecuta sin guardar en BD. Útil para pruebas.",
+        help="Muestra eventos sin guardar en MongoDB",
+    )
+    parser.add_argument(
+        "--setup-db",
+        action="store_true",
+        help="Crea índices MongoDB y sale",
     )
     args = parser.parse_args()
 
-    sources = None if "all" in args.source else args.source
-    mode = "DRY RUN" if args.dry_run else "PRODUCCIÓN"
+    if args.setup_db:
+        from scraper.storage.mongo_setup import setup_indexes
+        setup_indexes()
+        return
 
-    logger.info("━" * 50)
-    logger.info("🕷️   GDL Qué Hacer — Scraper")
-    logger.info("   Modo    : %s", mode)
-    logger.info("   Fuentes : %s", sources or "todas")
+    sources = None if "all" in args.source else args.source
+
+    logger.info("━" * 60)
+    logger.info("🕷️   GDL Qué Hacer — Scraper v6")
+    logger.info("   Modo    : %s", "DRY RUN" if args.dry_run else "PRODUCCIÓN")
+    logger.info("   Fuentes : %s", sources or "TODAS (11 fuentes)")
     logger.info("   Hora    : %s", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
-    logger.info("━" * 50)
+    logger.info("━" * 60)
 
     stats = asyncio.run(run_scraper(sources=sources, dry_run=args.dry_run))
     logger.info("Finalizado: %s", stats)
