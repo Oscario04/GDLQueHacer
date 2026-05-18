@@ -208,7 +208,7 @@ async def trigger_retrain(
                 events_df, interactions_df = load_synthetic_data()
                 models = train_category_classifier(events_df)
                 vectorizer = models["vectorizer"]
-                train_quality_scorer(events_df, vectorizer)
+                train_quality_scorer(events_df)           # ✅ solo events_df
                 train_knn_recommender(events_df, interactions_df, vectorizer)
                 train_svm_ranker(events_df, interactions_df, vectorizer)
 
@@ -269,4 +269,61 @@ async def stream_logs(
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
         },
+    )
+
+
+# ── Export CSV de eventos ─────────────────────────────────────────────
+
+@router.get("/export/events-csv")
+async def export_events_csv(
+    admin: TokenData = Depends(require_admin),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+) -> StreamingResponse:
+    import csv
+    import io
+
+    cursor = db.events.find(
+        {},
+        {
+            "_id": 1, "title": 1, "description": 1, "category": 1,
+            "status": 1, "date_start": 1, "date_end": 1, "location": 1,
+            "price": 1, "quality_ml": 1, "tags": 1,
+            "url_source": 1, "image_url": 1, "created_at": 1,
+        }
+    ).sort("created_at", -1)
+
+    events = await cursor.to_list(length=10_000)
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "id", "title", "description", "category", "status",
+        "date_start", "date_end", "location", "price",
+        "quality_ml", "tags", "url_source", "image_url", "created_at",
+    ])
+    for e in events:
+        writer.writerow([
+            str(e.get("_id", "")),
+            e.get("title", ""),
+            e.get("description", ""),
+            e.get("category", ""),
+            e.get("status", ""),
+            e.get("date_start", ""),
+            e.get("date_end", ""),
+            e.get("location", ""),
+            e.get("price", ""),
+            e.get("quality_ml", ""),
+            ",".join(e.get("tags", [])),
+            e.get("url_source", ""),
+            e.get("image_url", ""),
+            e.get("created_at", ""),
+        ])
+
+    output.seek(0)
+    filename = f"eventos_gdl_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )

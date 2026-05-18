@@ -2,15 +2,20 @@
 ml/training/train_models.py
 Entrena y guarda todos los modelos ML del sistema:
 
-1. TF-IDF Vectorizer  — vectorización de texto
-2. Clasificador de categoría (LogReg + SVM comparado)
-3. SVM Quality Scorer — predice si un evento tiene alta/baja calidad
-4. KNN Recommender    — base para recomendaciones por similitud
+1. TF-IDF Vectorizer      — vectorización de texto
+2. Clasificador de categoría (LogReg + LinearSVC comparado)
+3. Quality Scorer         — GradientBoosting sobre features ESTRUCTURADAS
+4. KNN Recommender        — recomendaciones por similitud con SVD
+5. Ranker                 — re-ranking de candidatos KNN
 
-Datasets soportados:
-  A) Sintético generado por generate_dataset.py
-  B) Kaggle Event Recommendation Engine Challenge (Meetup.com)
-     Descarga: https://www.kaggle.com/c/event-recommendation-engine-challenge/data
+Mejoras v4:
+- KNN: SVD sube de 50 → 100 componentes para capturar más varianza semántica.
+- Ranker: cambia de LogisticRegression → GradientBoostingClassifier
+  (más robusto con features de alta dimensión y señal débil).
+- Ranker: se añade quality_ml del evento como feature extra,
+  capturando la calidad objetiva del evento además de la similitud usuario-evento.
+- Quality Scorer: threshold dinámico basado en la mediana real del dataset
+  en lugar de 0.5 fijo, para manejar mejor el desbalance de clases.
 
 Uso:
     python -m ml.training.train_models
@@ -22,11 +27,15 @@ import logging
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from datetime import datetime, timezone
+
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.svm import SVC, LinearSVC
-from sklearn.neighbors import NearestNeighbors, KNeighborsClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.svm import LinearSVC
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+from sklearn.neighbors import NearestNeighbors
+from sklearn.decomposition import TruncatedSVD
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder, normalize
 from sklearn.metrics import classification_report, accuracy_score
 from sklearn.pipeline import Pipeline
@@ -36,8 +45,7 @@ warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(levelname)s — %(message)s")
 logger = logging.getLogger(__name__)
 
-# Directorios
-DATA_DIR = Path("ml/training/data")
+DATA_DIR   = Path("ml/training/data")
 MODELS_DIR = Path("ml/saved_models")
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -47,23 +55,15 @@ MODELS_DIR.mkdir(parents=True, exist_ok=True)
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Carga los datasets sintéticos generados por generate_dataset.py."""
-    events_path = DATA_DIR / "events_synthetic.csv"
-    interactions_path = DATA_DIR / "interactions_synthetic.csv"
-
-    if not events_path.exists():
-        logger.info("Generando dataset sintético...")
-        from ml.training.generate_dataset import (
-            generate_events_dataset, generate_interactions_dataset
-        )
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        events_df = generate_events_dataset(600)
-        interactions_df = generate_interactions_dataset()
-        events_df.to_csv(events_path, index=False)
-        interactions_df.to_csv(interactions_path, index=False)
-    else:
-        events_df = pd.read_csv(events_path)
-        interactions_df = pd.read_csv(interactions_path)
+    logger.info("Generando dataset sintético v4...")
+    from ml.training.generate_dataset import (
+        generate_events_dataset, generate_interactions_dataset
+    )
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    events_df       = generate_events_dataset(600)
+    interactions_df = generate_interactions_dataset()
+    events_df.to_csv(DATA_DIR / "events_synthetic.csv", index=False)
+    interactions_df.to_csv(DATA_DIR / "interactions_synthetic.csv", index=False)
 
     logger.info("Eventos cargados: %d", len(events_df))
     logger.info("Interacciones cargadas: %d", len(interactions_df))
@@ -71,124 +71,96 @@ def load_synthetic_data() -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def load_kaggle_data(kaggle_dir: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Carga el dataset de Kaggle Event Recommendation Engine Challenge.
-
-    Estructura esperada en kaggle_dir/:
-      events.csv     — event_id, description, ...
-      train.csv      — user, event, invited, timestamp, interested, not_interested
-      users.csv      — user_id, locale, ...
-
-    Descarga en: https://www.kaggle.com/c/event-recommendation-engine-challenge/data
-    """
+    """Carga el dataset de Kaggle Event Recommendation Engine Challenge."""
     kaggle_path = Path(kaggle_dir)
 
     events_raw = pd.read_csv(kaggle_path / "events.csv", nrows=10000)
-    train_raw = pd.read_csv(kaggle_path / "train.csv")
+    train_raw  = pd.read_csv(kaggle_path / "train.csv")
 
-    # Preparar eventos
     events_df = events_raw[["event_id", "description"]].copy()
     events_df = events_df.dropna(subset=["description"])
     events_df["text"] = events_df["description"].fillna("")
 
-    # Asignar categorías aproximadas via keywords (Kaggle no tiene categorías exactas)
     def infer_category(text: str) -> str:
-        text_lower = str(text).lower()
-        if any(w in text_lower for w in ["music", "concert", "band", "jazz", "rock"]):
+        t = str(text).lower()
+        if any(w in t for w in ["music", "concert", "band", "jazz", "rock"]):
             return "entretenimiento"
-        if any(w in text_lower for w in ["food", "drink", "wine", "beer", "cook"]):
+        if any(w in t for w in ["food", "drink", "wine", "beer", "cook"]):
             return "gastronomico"
-        if any(w in text_lower for w in ["sport", "run", "yoga", "fitness", "bike"]):
+        if any(w in t for w in ["sport", "run", "yoga", "fitness", "bike"]):
             return "deportivo"
-        if any(w in text_lower for w in ["art", "museum", "exhibit", "film", "book"]):
+        if any(w in t for w in ["art", "museum", "exhibit", "film", "book"]):
             return "cultural"
-        return "entretenimiento"
+        return "otro"
 
-    events_df["category"] = events_df["text"].apply(infer_category)
-    events_df["quality_ml"] = np.random.beta(5, 2, len(events_df)).round(4)
+    events_df["category"]   = events_df["text"].apply(infer_category)
+    events_df["quality_ml"] = np.random.beta(3, 2, len(events_df)).round(4)
 
-    # Preparar interacciones
     interactions_df = train_raw.copy()
-    interactions_df["label"] = (
-        interactions_df["interested"].fillna(0).astype(int)
-    )
-    interactions_df = interactions_df.rename(
-        columns={"user": "user_id", "event": "event_id"}
-    )
-    interactions_df["interaction_type"] = interactions_df["label"].map(
-        {1: "interested", 0: "view"}
-    )
+    interactions_df["label"]            = interactions_df["interested"].fillna(0).astype(int)
+    interactions_df                     = interactions_df.rename(columns={"user": "user_id", "event": "event_id"})
+    interactions_df["interaction_type"] = interactions_df["label"].map({1: "interested", 0: "view"})
 
     logger.info("Kaggle eventos: %d | interacciones: %d", len(events_df), len(interactions_df))
     return events_df, interactions_df
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 2. ENTRENAMIENTO TF-IDF + CLASIFICADOR DE CATEGORÍA
+# 2. CLASIFICADOR DE CATEGORÍA
 # ═══════════════════════════════════════════════════════════════════════
 
 def train_category_classifier(events_df: pd.DataFrame) -> dict:
     """
-    Entrena TF-IDF + LogisticRegression como clasificador principal.
-    También entrena LinearSVC y compara — guarda el mejor.
+    Entrena TF-IDF + LogisticRegression y LinearSVC. Guarda el mejor.
+    Con el overlap léxico de generate_dataset v4 se espera accuracy ~0.75-0.88.
     """
     logger.info("\n━━━ Entrenando clasificador de categorías ━━━")
 
     X = events_df["text"].fillna("").astype(str)
     y = events_df["category"]
 
-    # TF-IDF Vectorizer
     vectorizer = TfidfVectorizer(
         max_features=5000,
-        ngram_range=(1, 2),       # Unigramas y bigramas
+        ngram_range=(1, 2),
         min_df=2,
         max_df=0.95,
-        sublinear_tf=True,         # TF logarítmico
+        sublinear_tf=True,
         strip_accents="unicode",
         analyzer="word",
     )
-
     X_vec = vectorizer.fit_transform(X)
+
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     X_train, X_test, y_train, y_test = train_test_split(
         X_vec, y, test_size=0.2, random_state=42, stratify=y
     )
 
     results = {}
 
-    # ── Logistic Regression ──────────────────────────────────────────
-    lr = LogisticRegression(
-        max_iter=1000,
-        C=1.0,
-        multi_class="multinomial",
-        solver="lbfgs",
-        random_state=42,
-    )
+    lr = LogisticRegression(max_iter=1000, C=1.0, solver="lbfgs", random_state=42)
     lr.fit(X_train, y_train)
     lr_acc = accuracy_score(y_test, lr.predict(X_test))
     results["LogisticRegression"] = {"model": lr, "accuracy": lr_acc}
     logger.info("LogisticRegression accuracy: %.4f", lr_acc)
 
-    # ── SVM (LinearSVC — más rápido para texto) ──────────────────────
-    svm = LinearSVC(
-        C=1.0,
-        max_iter=2000,
-        random_state=42,
-    )
+    svm = LinearSVC(C=1.0, max_iter=2000, random_state=42)
     svm.fit(X_train, y_train)
     svm_acc = accuracy_score(y_test, svm.predict(X_test))
     results["LinearSVC"] = {"model": svm, "accuracy": svm_acc}
     logger.info("LinearSVC accuracy: %.4f", svm_acc)
 
-    # ── Seleccionar el mejor ─────────────────────────────────────────
-    best_name = max(results, key=lambda k: results[k]["accuracy"])
+    best_name  = max(results, key=lambda k: results[k]["accuracy"])
     best_model = results[best_name]["model"]
     logger.info("✅  Mejor clasificador: %s (acc=%.4f)", best_name, results[best_name]["accuracy"])
 
-    # Classification report del mejor
     y_pred = best_model.predict(X_test)
     logger.info("\n%s", classification_report(y_test, y_pred))
 
-    # Guardar
+    cv_scores = cross_val_score(lr, X_vec, y, cv=cv, scoring="f1_weighted")
+    logger.info("CV F1 (weighted) — scores: %s | Mean: %.4f", cv_scores.round(4), cv_scores.mean())
+    if cv_scores.mean() > 0.98:
+        logger.warning("⚠️  CV F1 > 0.98: posible separación trivial en el dataset.")
+
     joblib.dump(vectorizer, MODELS_DIR / "tfidf_vectorizer.joblib")
     joblib.dump(best_model, MODELS_DIR / "category_classifier.joblib")
     logger.info("💾  Guardados: tfidf_vectorizer.joblib + category_classifier.joblib")
@@ -197,50 +169,138 @@ def train_category_classifier(events_df: pd.DataFrame) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 3. ENTRENAMIENTO SVM QUALITY SCORER
+# 3. QUALITY SCORER — features estructuradas + threshold dinámico
 # ═══════════════════════════════════════════════════════════════════════
 
-def train_quality_scorer(
-    events_df: pd.DataFrame,
-    vectorizer: TfidfVectorizer,
-) -> None:
+def _extract_quality_features(events_df: pd.DataFrame) -> np.ndarray:
     """
-    Entrena un SVM binario que predice si un evento tiene alta calidad
-    (quality_ml >= 0.5) basándose en el vector TF-IDF de su texto.
+    Extrae las MISMAS features que usa compute_quality_score() en classifier.py.
+
+    Columnas (8 features):
+      0  has_image
+      1  desc_len_score_full    — 1.0 si desc >= 200 chars
+      2  desc_len_score_medium  — 1.0 si desc >= 80 chars
+      3  desc_len_raw_norm      — longitud normalizada [0,1] (cap 500)
+      4  has_location
+      5  has_price
+      6  has_category
+      7  date_is_future
     """
-    logger.info("\n━━━ Entrenando SVM Quality Scorer ━━━")
+    now = datetime.now(timezone.utc)
 
-    X_text = events_df["text"].fillna("").astype(str)
-    y_quality = (events_df["quality_ml"] >= 0.5).astype(int)
+    def parse_date(raw):
+        if pd.isna(raw) or not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(raw))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except (ValueError, TypeError):
+            return None
 
-    X_vec = vectorizer.transform(X_text)
+    rows = []
+    for _, row in events_df.iterrows():
+        desc  = str(row.get("description", "") or "").strip()
+        dt    = parse_date(row.get("date_start"))
+        lat   = row.get("latitude")
+        lon   = row.get("longitude")
+        price = row.get("price")
+        cat   = row.get("category", "")
+        img   = row.get("image_url", "")
+
+        has_image    = 1.0 if img and not pd.isna(img) else 0.0
+        desc_len     = len(desc)
+        desc_full    = 1.0 if desc_len >= 200 else 0.0
+        desc_medium  = 1.0 if desc_len >= 80 else 0.0
+        desc_norm    = min(desc_len / 500.0, 1.0)
+        has_location = 1.0 if (lat is not None and lon is not None
+                                and not pd.isna(lat) and not pd.isna(lon)) else 0.0
+        has_price    = 0.0 if (price is None or pd.isna(price)) else 1.0
+        has_category = 1.0 if cat else 0.0
+        future       = 1.0 if (dt is not None and dt > now) else 0.0
+
+        rows.append([has_image, desc_full, desc_medium, desc_norm,
+                     has_location, has_price, has_category, future])
+
+    return np.array(rows, dtype=np.float32)
+
+
+QUALITY_FEATURE_NAMES = [
+    "has_image",
+    "desc_len_score_full",
+    "desc_len_score_medium",
+    "desc_len_raw_norm",
+    "has_location",
+    "has_price",
+    "has_category",
+    "date_is_future",
+]
+
+
+def train_quality_scorer(events_df: pd.DataFrame) -> None:
+    """
+    Entrena GradientBoostingClassifier sobre features estructuradas.
+
+    v4: threshold dinámico (mediana del dataset) en lugar de 0.5 fijo.
+    Maneja mejor distribuciones desbalanceadas.
+    """
+    logger.info("\n━━━ Entrenando Quality Scorer (features estructuradas) ━━━")
+
+    X = _extract_quality_features(events_df)
+
+    # Threshold dinámico: mediana de quality_ml del dataset real
+    threshold = float(np.median(events_df["quality_ml"]))
+    logger.info("Threshold dinámico (mediana quality_ml): %.4f", threshold)
+    y = (events_df["quality_ml"] >= threshold).astype(int).values
+
+    high = y.sum()
+    low  = (y == 0).sum()
+    logger.info("Distribución de calidad — alta: %d | baja: %d", high, low)
+
+    if abs(high - low) / len(y) > 0.4:
+        logger.warning(
+            "⚠️  Desbalance fuerte (%.0f%% alta). Ajusta tiers en generate_dataset.py.",
+            100 * high / len(y),
+        )
+
     X_train, X_test, y_train, y_test = train_test_split(
-        X_vec, y_quality, test_size=0.2, random_state=42
+        X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    # SVC con kernel RBF para mejor separación no lineal
-    svm_quality = SVC(
-        kernel="linear",    # Linear es más eficiente para alta dimensión
-        C=1.0,
-        probability=False,  # decision_function es suficiente para scoring
+    gb = GradientBoostingClassifier(
+        n_estimators=200,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
         random_state=42,
-        class_weight="balanced",
     )
-    svm_quality.fit(X_train, y_train)
+    gb.fit(X_train, y_train)
 
-    acc = accuracy_score(y_test, svm_quality.predict(X_test))
-    logger.info("SVM Quality Scorer accuracy: %.4f", acc)
+    acc = accuracy_score(y_test, gb.predict(X_test))
+    logger.info("GradientBoosting accuracy: %.4f", acc)
+    logger.info("\n%s", classification_report(y_test, gb.predict(X_test),
+                                              target_names=["baja_calidad", "alta_calidad"]))
 
-    # Cross-validation
-    cv_scores = cross_val_score(svm_quality, X_vec, y_quality, cv=5, scoring="f1")
+    cv_scores = cross_val_score(gb, X, y, cv=5, scoring="f1")
     logger.info("CV F1 scores: %s | Mean: %.4f", cv_scores.round(4), cv_scores.mean())
 
-    joblib.dump(svm_quality, MODELS_DIR / "svm_quality_scorer.joblib")
-    logger.info("💾  Guardado: svm_quality_scorer.joblib")
+    logger.info("\nImportancia de features:")
+    for name, imp in sorted(
+        zip(QUALITY_FEATURE_NAMES, gb.feature_importances_),
+        key=lambda x: -x[1],
+    ):
+        bar = "█" * int(imp * 30)
+        logger.info("  %-25s %.4f  %s", name, imp, bar)
+
+    joblib.dump(gb,        MODELS_DIR / "quality_scorer.joblib")
+    joblib.dump(QUALITY_FEATURE_NAMES, MODELS_DIR / "quality_feature_names.joblib")
+    joblib.dump(threshold, MODELS_DIR / "quality_threshold.joblib")
+    logger.info("💾  Guardados: quality_scorer.joblib + quality_feature_names.joblib + quality_threshold.joblib")
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4. ENTRENAMIENTO KNN PARA RECOMENDACIONES
+# 4. KNN RECOMMENDER — SVD 100 componentes
 # ═══════════════════════════════════════════════════════════════════════
 
 def train_knn_recommender(
@@ -249,32 +309,34 @@ def train_knn_recommender(
     vectorizer: TfidfVectorizer,
 ) -> None:
     """
-    Construye y guarda el modelo KNN para recomendaciones de contenido.
+    KNN sobre vectores TF-IDF reducidos con SVD + one-hot de categoría.
 
-    Estrategia:
-    - Feature matrix: vectores TF-IDF de eventos + codificación de categoría
-    - KNN entrenado sobre esta matrix para encontrar eventos similares
-    - En inferencia: el vector del usuario (promedio de eventos vistos)
-      se busca en este espacio
+    v4: SVD sube de 50 → 100 componentes para capturar más varianza semántica.
     """
-    logger.info("\n━━━ Entrenando KNN Recommender ━━━")
+    logger.info("\n━━━ Entrenando KNN Recommender (SVD 100 componentes) ━━━")
 
-    X_text = events_df["text"].fillna("").astype(str)
+    X_text  = events_df["text"].fillna("").astype(str)
     X_tfidf = vectorizer.transform(X_text)
 
-    # Codificar categorías como features adicionales
+    # v4: n_components sube a 100
+    n_components = min(100, X_tfidf.shape[1] - 1, X_tfidf.shape[0] - 1)
+    svd = TruncatedSVD(n_components=n_components, random_state=42)
+    X_svd     = svd.fit_transform(X_tfidf)
+    explained = svd.explained_variance_ratio_.sum()
+    logger.info(
+        "SVD: %d → %d dims | varianza explicada: %.2f%%",
+        X_tfidf.shape[1], n_components, explained * 100,
+    )
+
     le = LabelEncoder()
     cat_encoded = le.fit_transform(events_df["category"])
-    cat_matrix = np.zeros((len(cat_encoded), len(le.classes_)))
+    cat_matrix  = np.zeros((len(cat_encoded), len(le.classes_)))
     for i, c in enumerate(cat_encoded):
         cat_matrix[i, c] = 1.0
 
-    # Combinar TF-IDF + categoría codificada (ponderado)
-    from scipy.sparse import hstack, csr_matrix
-    X_combined = hstack([X_tfidf, csr_matrix(cat_matrix * 0.5)])
+    X_combined   = np.hstack([X_svd, cat_matrix * 0.5])
     X_normalized = normalize(X_combined, norm="l2")
 
-    # KNN con métrica coseno (brute force para alta dimensionalidad)
     knn = NearestNeighbors(
         n_neighbors=10,
         metric="cosine",
@@ -282,21 +344,25 @@ def train_knn_recommender(
         n_jobs=-1,
     )
     knn.fit(X_normalized)
-
     logger.info("KNN entrenado sobre %d eventos, %d features", *X_normalized.shape)
 
-    # Guardar modelos
     joblib.dump(knn, MODELS_DIR / "knn_recommender.joblib")
-    joblib.dump(le, MODELS_DIR / "category_label_encoder.joblib")
+    joblib.dump(le,  MODELS_DIR / "category_label_encoder.joblib")
+    joblib.dump(svd, MODELS_DIR / "tfidf_svd.joblib")
     joblib.dump(
-        {"event_ids": events_df.index.tolist(), "n_features": X_normalized.shape[1]},
-        MODELS_DIR / "knn_metadata.joblib"
+        {
+            "event_ids":          events_df.index.tolist(),
+            "n_features":         X_normalized.shape[1],
+            "n_components":       n_components,
+            "explained_variance": float(explained),
+        },
+        MODELS_DIR / "knn_metadata.joblib",
     )
-    logger.info("💾  Guardados: knn_recommender.joblib + category_label_encoder.joblib")
+    logger.info("💾  Guardados: knn_recommender.joblib + tfidf_svd.joblib + category_label_encoder.joblib")
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 5. ENTRENAMIENTO SVM PARA RANKING DE RECOMENDACIONES
+# 5. RANKER — GradientBoosting + quality_ml como feature
 # ═══════════════════════════════════════════════════════════════════════
 
 def train_svm_ranker(
@@ -305,39 +371,38 @@ def train_svm_ranker(
     vectorizer: TfidfVectorizer,
 ) -> None:
     """
-    Entrena un SVM binario para predecir si un usuario interactuará
-    positivamente con un evento dado (relevance ranking).
+    Clasificador de relevancia usuario-evento.
 
-    Features: [user_preference_vector ⊕ event_tfidf_vector]
-    Label:    1 si hay interacción positiva (save/interested), 0 si no
+    v4 mejoras:
+    - GradientBoostingClassifier en lugar de LogisticRegression.
+    - quality_ml del evento como feature escalar extra.
+    - Features: [diff, prod, |diff|, quality_ml]
     """
-    logger.info("\n━━━ Entrenando SVM Ranker de Recomendaciones ━━━")
+    logger.info("\n━━━ Entrenando Ranker de Recomendaciones (GradientBoosting v4) ━━━")
 
-    X_text = events_df["text"].fillna("").astype(str)
+    X_text        = events_df["text"].fillna("").astype(str)
     event_vectors = vectorizer.transform(X_text).toarray()
+    quality_scores = events_df["quality_ml"].values
 
-    # Construir vectores de usuario como promedio de eventos con los que interactuó
     positive_types = {"save", "interested"}
-    user_vectors = {}
+    user_vectors: dict = {}
 
     for user_id, group in interactions_df.groupby("user_id"):
         positive_events = group[
             group["interaction_type"].isin(positive_types)
         ]["event_id"].tolist()
 
-        valid_event_ids = [
-            eid for eid in positive_events
-            if isinstance(eid, int) and 0 <= eid < len(event_vectors)
+        valid_ids = [
+            int(eid) for eid in positive_events
+            if isinstance(eid, (int, np.integer)) and 0 <= int(eid) < len(event_vectors)
         ]
-        if valid_event_ids:
-            user_vec = np.mean(event_vectors[valid_event_ids], axis=0)
-            user_vectors[user_id] = user_vec
+        if valid_ids:
+            user_vectors[user_id] = np.mean(event_vectors[valid_ids], axis=0)
 
     if not user_vectors:
-        logger.warning("No hay suficientes interacciones positivas para entrenar SVM Ranker.")
+        logger.warning("Sin interacciones positivas suficientes para el ranker.")
         return
 
-    # Construir dataset de entrenamiento
     X_pairs, y_labels = [], []
 
     for _, row in interactions_df.iterrows():
@@ -346,42 +411,55 @@ def train_svm_ranker(
 
         if uid not in user_vectors:
             continue
-        if not isinstance(eid, int) or eid >= len(event_vectors):
+        if not isinstance(eid, (int, np.integer)) or int(eid) >= len(event_vectors):
             continue
 
-        user_vec = user_vectors[uid]
-        event_vec = event_vectors[eid]
+        user_vec  = user_vectors[uid]
+        event_vec = event_vectors[int(eid)]
+        quality   = quality_scores[int(eid)]
 
-        # Feature: concatenación de vectores usuario + evento
-        feature = np.concatenate([user_vec, event_vec])
-        X_pairs.append(feature)
+        diff     = user_vec - event_vec
+        prod     = user_vec * event_vec
+        abs_diff = np.abs(diff)
+
+        # v4: quality_ml como feature extra
+        X_pairs.append(np.concatenate([diff, prod, abs_diff, [quality]]))
         y_labels.append(int(row["label"]))
 
     if len(X_pairs) < 100:
-        logger.warning("Muy pocas muestras (%d) para SVM Ranker. Se omite.", len(X_pairs))
+        logger.warning("Muy pocas muestras (%d) para el ranker. Se omite.", len(X_pairs))
         return
 
-    X_pairs = np.array(X_pairs)
+    X_pairs  = np.array(X_pairs)
     y_labels = np.array(y_labels)
 
+    logger.info(
+        "Dataset ranker: %d muestras | positivas: %d | negativas: %d",
+        len(y_labels), y_labels.sum(), (y_labels == 0).sum(),
+    )
+
     X_train, X_test, y_train, y_test = train_test_split(
-        X_pairs, y_labels, test_size=0.2, random_state=42
+        X_pairs, y_labels, test_size=0.2, random_state=42, stratify=y_labels
     )
 
-    # SVM con kernel lineal (eficiente para alta dimensión)
-    svm_ranker = LinearSVC(
-        C=0.1,
-        max_iter=2000,
+    # v4: GradientBoosting
+    ranker = GradientBoostingClassifier(
+        n_estimators=200,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.8,
         random_state=42,
-        class_weight="balanced",
     )
-    svm_ranker.fit(X_train, y_train)
+    ranker.fit(X_train, y_train)
 
-    acc = accuracy_score(y_test, svm_ranker.predict(X_test))
-    logger.info("SVM Ranker accuracy: %.4f", acc)
-    logger.info("\n%s", classification_report(y_test, svm_ranker.predict(X_test)))
+    acc = accuracy_score(y_test, ranker.predict(X_test))
+    logger.info("Ranker accuracy: %.4f", acc)
+    logger.info("\n%s", classification_report(y_test, ranker.predict(X_test)))
 
-    joblib.dump(svm_ranker, MODELS_DIR / "svm_ranker.joblib")
+    cv_scores = cross_val_score(ranker, X_pairs, y_labels, cv=5, scoring="f1")
+    logger.info("CV F1 scores: %s | Mean: %.4f", cv_scores.round(4), cv_scores.mean())
+
+    joblib.dump(ranker, MODELS_DIR / "svm_ranker.joblib")
     logger.info("💾  Guardado: svm_ranker.joblib")
 
 
@@ -390,50 +468,34 @@ def train_svm_ranker(
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="Entrenar modelos ML de GDL Qué Hacer")
-    parser.add_argument(
-        "--use-kaggle",
-        action="store_true",
-        help="Usar dataset de Kaggle en lugar del sintético",
-    )
-    parser.add_argument(
-        "--kaggle-dir",
-        default="ml/training/data/kaggle",
-        help="Directorio con los archivos CSV de Kaggle",
-    )
+    parser = argparse.ArgumentParser(description="Entrenar modelos ML — GDL Qué Hacer v4")
+    parser.add_argument("--use-kaggle", action="store_true")
+    parser.add_argument("--kaggle-dir", default="ml/training/data/kaggle")
     args = parser.parse_args()
 
     logger.info("=" * 60)
-    logger.info("  GDL Qué Hacer — Pipeline de Entrenamiento ML")
+    logger.info("  GDL Qué Hacer — Pipeline de Entrenamiento ML v4")
     logger.info("=" * 60)
 
-    # Cargar datos
     if args.use_kaggle:
         logger.info("📦  Cargando dataset de Kaggle desde %s", args.kaggle_dir)
         events_df, interactions_df = load_kaggle_data(args.kaggle_dir)
     else:
-        logger.info("📦  Usando dataset sintético")
+        logger.info("📦  Usando dataset sintético v4")
         events_df, interactions_df = load_synthetic_data()
 
-    # 1. Clasificador de categorías (incluye TF-IDF)
-    models = train_category_classifier(events_df)
+    models     = train_category_classifier(events_df)
     vectorizer = models["vectorizer"]
 
-    # 2. SVM Quality Scorer
-    train_quality_scorer(events_df, vectorizer)
-
-    # 3. KNN Recommender
+    train_quality_scorer(events_df)
     train_knn_recommender(events_df, interactions_df, vectorizer)
-
-    # 4. SVM Ranker
     train_svm_ranker(events_df, interactions_df, vectorizer)
 
     logger.info("\n" + "=" * 60)
-    logger.info("  ✅  Entrenamiento completado. Modelos guardados en:")
+    logger.info("  ✅  Entrenamiento completado. Modelos en:")
     logger.info("  %s", MODELS_DIR.resolve())
     logger.info("=" * 60)
 
-    # Listar modelos guardados
     for f in sorted(MODELS_DIR.glob("*.joblib")):
         size_kb = f.stat().st_size / 1024
         logger.info("  📁  %s (%.1f KB)", f.name, size_kb)

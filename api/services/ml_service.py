@@ -1,176 +1,284 @@
 """
-services/ml_service.py
-Servicio ML para clasificación de categoría, score de calidad y normalización.
-Carga los modelos entrenados desde disco (joblib) y los mantiene en memoria.
+api/services/ml_service.py
+Servicio ML para clasificación de eventos y scoring de calidad.
+
+v3 — cambios respecto a v2:
+  - Añade load_ml_models() como función pública (requerida por api/main.py).
+  - Quality Scorer usa features ESTRUCTURADAS (imagen, descripción, coords, etc.)
+    en lugar de TF-IDF. Esto alinea inferencia con entrenamiento.
+  - Compatibilidad hacia atrás: carga 'quality_scorer.joblib' primero,
+    y si no existe busca 'svm_quality_scorer.joblib' (nombre anterior).
+  - reload_models() limpia la caché de lru_cache para forzar recarga
+    después de un reentrenamiento.
 """
-import joblib
-import numpy as np
+
+from __future__ import annotations
+
 import logging
-import os
-import re
+from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from api.config.settings import get_settings
+import numpy as np
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
-# Directorio de modelos guardados
-MODELS_DIR = Path(settings.ML_MODELS_PATH)
-
-# ── Singleton de modelos (cargados una vez al iniciar la app) ─────────
-_models: dict[str, Any] = {}
+MODELS_DIR = Path("ml/saved_models")
 
 
-def load_ml_models() -> None:
+# ═══════════════════════════════════════════════════════════════════════
+# Carga de modelos
+# ═══════════════════════════════════════════════════════════════════════
+
+def _try_load(filename: str) -> Any | None:
+    """Carga un joblib o devuelve None logueando el warning."""
+    import joblib
+    path = MODELS_DIR / filename
+    if not path.exists():
+        return None
+    try:
+        model = joblib.load(path)
+        logger.info("🤖  Modelo cargado: %s", filename.replace(".joblib", ""))
+        return model
+    except Exception as exc:
+        logger.error("❌  Error cargando %s: %s", filename, exc)
+        return None
+
+
+@lru_cache(maxsize=1)
+def _load_models() -> dict:
     """
-    Carga los modelos entrenados desde disco.
-    Llamar durante el startup de FastAPI.
+    Carga todos los modelos ML una sola vez (lazy + thread-safe con lru_cache).
+    Compatibilidad hacia atrás para nombres de archivo anteriores.
     """
-    global _models
-    required = ["tfidf_vectorizer", "category_classifier", "svm_quality_scorer"]
+    models: dict[str, Any] = {"active": False}
 
-    for name in required:
-        path = MODELS_DIR / f"{name}.joblib"
-        if path.exists():
-            _models[name] = joblib.load(path)
-            logger.info("🤖  Modelo cargado: %s", name)
-        else:
-            logger.warning("⚠️   Modelo no encontrado: %s — usando modo degradado", path)
+    vectorizer = _try_load("tfidf_vectorizer.joblib")
+    classifier = _try_load("category_classifier.joblib")
 
-    if not _models:
-        logger.warning("⚠️   Sin modelos ML. Ejecuta ml/training/train_models.py primero.")
-
-
-def _preprocess_text(text: str) -> str:
-    """Limpieza básica de texto para vectorización."""
-    text = text.lower().strip()
-    text = re.sub(r"[^\w\sáéíóúüñ]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text
-
-
-def classify_event(title: str, description: str = "") -> dict[str, Any]:
-    """
-    Clasifica la categoría de un evento y calcula su quality_ml score.
-
-    Returns:
-        {
-            "category": str,
-            "category_confidence": float,
-            "quality_ml": float,
-            "tfidf_vector": list[float],
-        }
-    """
-    text = _preprocess_text(f"{title} {description}")
-
-    # ── Fallback si no hay modelos ────────────────────────────────────
-    if "tfidf_vectorizer" not in _models:
-        return {
-            "category": "otro",
-            "category_confidence": 0.0,
-            "quality_ml": _heuristic_quality(title, description),
-            "tfidf_vector": [],
-        }
-
-    # ── Vectorización TF-IDF ──────────────────────────────────────────
-    vectorizer = _models["tfidf_vectorizer"]
-    tfidf_matrix = vectorizer.transform([text])
-    tfidf_dense = tfidf_matrix.toarray()[0]
-
-    # ── Clasificación de categoría (LogReg o SVM) ─────────────────────
-    classifier = _models["category_classifier"]
-    category_pred = classifier.predict(tfidf_matrix)[0]
-
-    if hasattr(classifier, "predict_proba"):
-        probas = classifier.predict_proba(tfidf_matrix)[0]
-        confidence = float(np.max(probas))
-    else:
-        # SVM con decision_function
-        scores = classifier.decision_function(tfidf_matrix)[0]
-        if scores.ndim == 0:
-            confidence = float(abs(scores) / (abs(scores) + 1))
-        else:
-            confidence = float(np.max(scores) / (np.sum(np.abs(scores)) + 1e-9))
-
-    # ── Score de calidad SVM ──────────────────────────────────────────
-    quality_score = _compute_quality_score(
-        title=title,
-        description=description,
-        tfidf_matrix=tfidf_matrix,
-        confidence=confidence,
+    # Compatibilidad: nuevo nombre → nombre anterior
+    quality = (
+        _try_load("quality_scorer.joblib")
+        or _try_load("svm_quality_scorer.joblib")
     )
 
+    if vectorizer is None:
+        logger.warning("⚠️   Modelo no encontrado: tfidf_vectorizer.joblib — usando modo degradado")
+    if classifier is None:
+        logger.warning("⚠️   Modelo no encontrado: category_classifier.joblib — usando modo degradado")
+    if quality is None:
+        logger.warning("⚠️   Modelo no encontrado: quality_scorer.joblib — usando modo degradado")
+
+    if vectorizer and classifier and quality:
+        models.update({
+            "vectorizer": vectorizer,
+            "classifier": classifier,
+            "quality":    quality,
+            "active":     True,
+        })
+    else:
+        logger.warning("⚠️   Sin modelos ML. Ejecuta ml/training/train_models.py primero.")
+
+    return models
+
+
+def load_ml_models() -> dict:
+    """
+    Función PÚBLICA requerida por api/main.py en el startup de la aplicación.
+    Retorna el dict de modelos cargados (o vacío en modo degradado).
+    """
+    return _load_models()
+
+
+def reload_models() -> dict:
+    """
+    Fuerza recarga completa de modelos desde disco.
+    Llamar después de un reentrenamiento exitoso.
+    """
+    _load_models.cache_clear()
+    logger.info("🔄  Caché de modelos limpiada. Recargando...")
+    return _load_models()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Extracción de features estructuradas (Quality Scorer v3)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _extract_quality_features(
+    title: str,
+    description: str,
+    event: dict | None = None,
+) -> np.ndarray:
+    """
+    Extrae las mismas 8 features que usa train_models._extract_quality_features().
+    Debe mantenerse sincronizado con generate_dataset._compute_quality_score().
+
+    Features:
+      0  has_image
+      1  desc_len_score_full    (>= 200 chars)
+      2  desc_len_score_medium  (>= 80 chars)
+      3  desc_len_raw_norm      (normalizada a [0, 1], cap 500)
+      4  has_location
+      5  has_price
+      6  has_category
+      7  date_is_future
+    """
+    event = event or {}
+    now   = datetime.now(timezone.utc)
+
+    img       = event.get("image_url") or event.get("image", "")
+    has_image = 1.0 if (img and not _is_nan(img)) else 0.0
+
+    desc      = (description or "").strip()
+    desc_len  = len(desc)
+    desc_full   = 1.0 if desc_len >= 200 else 0.0
+    desc_medium = 1.0 if desc_len >= 80 else 0.0
+    desc_norm   = min(desc_len / 500.0, 1.0)
+
+    lat = event.get("latitude") or event.get("lat")
+    lon = event.get("longitude") or event.get("lon")
+    has_location = 1.0 if (lat is not None and lon is not None
+                            and not _is_nan(lat) and not _is_nan(lon)) else 0.0
+
+    price     = event.get("price")
+    has_price = 0.0 if (price is None or _is_nan(price)) else 1.0
+
+    cat          = event.get("category", "") or ""
+    has_category = 1.0 if cat else 0.0
+
+    raw_date = event.get("date_start") or event.get("start_date")
+    future   = 0.0
+    if raw_date:
+        try:
+            dt = datetime.fromisoformat(str(raw_date))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            future = 1.0 if dt > now else 0.0
+        except (ValueError, TypeError):
+            pass
+
+    return np.array([[
+        has_image,
+        desc_full,
+        desc_medium,
+        desc_norm,
+        has_location,
+        has_price,
+        has_category,
+        future,
+    ]], dtype=np.float32)
+
+
+def _is_nan(val: Any) -> bool:
+    """Verifica si un valor es NaN (float o pandas NaT)."""
+    try:
+        import math
+        return math.isnan(float(val))
+    except (TypeError, ValueError):
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# classify_event — función pública principal
+# ═══════════════════════════════════════════════════════════════════════
+
+def classify_event(
+    title: str,
+    description: str,
+    event: dict | None = None,
+) -> dict:
+    """
+    Clasifica un evento y devuelve:
+      {
+        "category":            str,
+        "category_confidence": float,
+        "quality_ml":          float,
+        "tfidf_vector":        list[float],
+        "models_active":       bool,
+      }
+
+    Parámetros:
+        title       — título del evento (ya limpio)
+        description — descripción del evento (ya limpia)
+        event       — dict con campos opcionales para quality scoring:
+                      image_url, latitude, longitude, price,
+                      category (si ya se conoce), date_start / start_date.
+    """
+    models = _load_models()
+
+    # ── Modo degradado: sin modelos ───────────────────────────────────
+    if not models["active"]:
+        return {
+            "category":            (event or {}).get("category", "otro"),
+            "category_confidence": 0.0,
+            "quality_ml":          0.0,
+            "tfidf_vector":        [],
+            "models_active":       False,
+        }
+
+    vectorizer = models["vectorizer"]
+    classifier = models["classifier"]
+    quality_m  = models["quality"]
+
+    text  = f"{title} {description}".strip()
+    X_vec = vectorizer.transform([text])
+
+    # ── Clasificación de categoría ────────────────────────────────────
+    category   = classifier.predict(X_vec)[0]
+    confidence = _get_confidence(classifier, X_vec)
+
+    # ── Quality Score ─────────────────────────────────────────────────
+    # Detectar si el scorer es el nuevo (features estructuradas) o el
+    # viejo (TF-IDF). El viejo acepta sparse matrix; el nuevo ndarray de 8 cols.
+    quality_ml = _predict_quality(quality_m, X_vec, title, description,
+                                  {**(event or {}), "category": category})
+
     return {
-        "category": category_pred,
-        "category_confidence": round(confidence, 4),
-        "quality_ml": round(quality_score, 4),
-        "tfidf_vector": tfidf_dense.tolist(),
+        "category":            str(category),
+        "category_confidence": round(float(confidence), 4),
+        "quality_ml":          round(float(quality_ml), 4),
+        "tfidf_vector":        X_vec.toarray()[0].tolist(),
+        "models_active":       True,
     }
 
 
-def _compute_quality_score(
+def _get_confidence(classifier: Any, X_vec: Any) -> float:
+    if hasattr(classifier, "predict_proba"):
+        proba = classifier.predict_proba(X_vec)[0]
+        return float(proba.max())
+    if hasattr(classifier, "decision_function"):
+        df = classifier.decision_function(X_vec)[0]
+        exp_s = np.exp(df - df.max())
+        return float(exp_s.max() / exp_s.sum())
+    return 0.0
+
+
+def _predict_quality(
+    quality_m: Any,
+    X_tfidf,
     title: str,
     description: str,
-    tfidf_matrix,
-    confidence: float,
+    event: dict,
 ) -> float:
     """
-    Calcula quality_ml combinando:
-    1. SVM de calidad (si está disponible)
-    2. Heurística de completitud de campos
-    3. Confianza del clasificador de categoría
+    Detecta si el scorer es v3 (8 features estructuradas) o v2 (TF-IDF)
+    y llama al método apropiado.
 
-    Score final = 0.5 * svm_score + 0.3 * completitud + 0.2 * confidence
+    Detección: si el modelo fue entrenado con n_features == 8, es v3.
+    GradientBoostingClassifier → n_features_in_ == 8 → scorer v3.
+    SVC con TF-IDF → n_features_in_ >> 8 → scorer v2 (legacy).
     """
-    # 1. SVM scorer
-    svm_score = 0.5  # Valor neutro por defecto
-    if "svm_quality_scorer" in _models:
-        try:
-            scorer = _models["svm_quality_scorer"]
-            raw = scorer.decision_function(tfidf_matrix)[0]
-            # Normalizar a [0, 1] via sigmoid
-            svm_score = float(1 / (1 + np.exp(-raw)))
-        except Exception:
-            pass
+    n_features = getattr(quality_m, "n_features_in_", None)
+    use_structured = (n_features is not None and n_features <= 16)
 
-    # 2. Heurística de completitud
-    completitud = _heuristic_quality(title, description)
+    if use_structured:
+        # Scorer v3: features estructuradas
+        X_q = _extract_quality_features(title, description, event)
+    else:
+        # Scorer v2 (legacy): usa TF-IDF directamente
+        X_q = X_tfidf
 
-    # 3. Ponderación final
-    quality = 0.5 * svm_score + 0.3 * completitud + 0.2 * confidence
-    return float(np.clip(quality, 0.0, 1.0))
-
-
-def _heuristic_quality(title: str, description: str = "") -> float:
-    """Score heurístico basado en completitud y longitud del contenido."""
-    score = 0.0
-
-    # Título no vacío y razonable
-    if title and len(title.strip()) >= 5:
-        score += 0.4
-    if title and len(title.strip()) >= 15:
-        score += 0.1
-
-    # Descripción
-    desc_len = len(description.strip()) if description else 0
-    if desc_len >= 30:
-        score += 0.3
-    elif desc_len >= 10:
-        score += 0.15
-
-    # Penalizar contenido claramente spam/vacío
-    if title and re.search(r"(test|prueba|lorem ipsum|undefined|null)", title.lower()):
-        score -= 0.3
-
-    return float(np.clip(score, 0.0, 1.0))
-
-
-def vectorize_text(text: str) -> list[float]:
-    """Vectoriza texto usando el TF-IDF cargado. Retorna lista vacía si no hay modelo."""
-    if "tfidf_vectorizer" not in _models:
-        return []
-    text_clean = _preprocess_text(text)
-    vec = _models["tfidf_vectorizer"].transform([text_clean])
-    return vec.toarray()[0].tolist()
+    if hasattr(quality_m, "predict_proba"):
+        return float(quality_m.predict_proba(X_q)[0][1])
+    return float(quality_m.predict(X_q)[0])

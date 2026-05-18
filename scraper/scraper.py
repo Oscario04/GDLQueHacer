@@ -1,30 +1,35 @@
 """
-scraper/scraper.py  — v6
+scraper/scraper.py  — v7
 Motor de scraping para GDL Qué Hacer — cobertura nacional completa.
 
 Fuentes activas (objetivo: 5,000–10,000 eventos):
   1.  Ticketmaster Nacional v2  — 50+ ciudades + 25 geo + géneros   → ~3,000
   2.  Ticketmaster Jalisco      — multi-radio + segmentos (legacy)   → ~500
   3.  Eventbrite Nacional v2    — 25 geo + 50 queries + categorías   → ~1,500
-  4.  Songkick                  — ★ NUEVO: 20 metro areas México      → ~500
-  5.  Fuentes Nacionales        — ★ NUEVO: CDMX, INBA, UNAM, etc.   → ~800
+  4.  Songkick                  — 20 metro areas México              → ~500
+  5.  Fuentes Nacionales        — CDMX, INBA, UNAM, etc.            → ~800
   6.  SIC HTML                  — scraper HTML original              → ~300
   7.  SIC API REST              — API REST oficial del SIC           → ~400
   8.  SIC Datos Abiertos        — CSVs abiertos del SIC             → ~300
   9.  datos.gob.mx              — datasets CKAN del gobierno         → ~200
   10. GDL Nuevas Fuentes        — Meetup, AllEvents, Superboletos    → ~300
   11. GDL Local                 — sitios locales (ITESO, UdeG, etc.) → ~200
+  12. Categorías Faltantes ★    — deportivo, gastronomico, otro      → ~2,500
+      (Liga MX, Charros, maratones, Eventbrite Food/Sports/Business,
+       Boletomovil, CONADE, ferias gastronómicas, UdeG, Expo GDL,
+       Jalisco Tech Hub, SIC Ferias, Meetup Tech/Gastro...)
 
-Total estimado: 5,000-10,000 eventos únicos.
+Total estimado: 7,000–12,000 eventos únicos.
 
 Uso:
-    python -m scraper.scraper                                # todas las fuentes
+    python -m scraper.scraper                                   # todas
+    python -m scraper.scraper --source categorias_faltantes     # solo nuevas cats
+    python -m scraper.scraper --source deportivo                # solo deportivo
+    python -m scraper.scraper --source gastronomico             # solo gastronómico
+    python -m scraper.scraper --source otro                     # solo otro
     python -m scraper.scraper --source ticketmaster_nacional
-    python -m scraper.scraper --source eventbrite_nacional
-    python -m scraper.scraper --source songkick
-    python -m scraper.scraper --source fuentes_nacionales
     python -m scraper.scraper --dry-run
-    python -m scraper.scraper --setup-db     # crear índices MongoDB
+    python -m scraper.scraper --setup-db
 """
 import asyncio
 import argparse
@@ -51,8 +56,8 @@ ALL_SOURCES = [
     "ticketmaster_jalisco",
     "eventbrite_nacional",
     "eventbrite",
-    "songkick",              # ★ nuevo
-    "fuentes_nacionales",    # ★ nuevo
+    "songkick",
+    "fuentes_nacionales",
     "sic",
     "sic_api",
     "ticketmaster_latam",
@@ -61,6 +66,11 @@ ALL_SOURCES = [
     "datos_gob_mx",
     "nuevas",
     "local",
+    # ── Categorías faltantes (v7) ──────────────────────────────────
+    "categorias_faltantes",   # todas las subcategorías juntas
+    "deportivo",              # solo subcategoría deportivo
+    "gastronomico",           # solo subcategoría gastronomico
+    "otro",                   # solo subcategoría otro
     "all",
 ]
 
@@ -80,7 +90,7 @@ async def run_scraper(
     # ── 1. Ticketmaster Nacional v2 ───────────────────────────────────
     if run_all or "ticketmaster_nacional" in (sources or []):
         if not ticketmaster_key:
-            logger.warning("TICKETMASTER_API_KEY no configurada.")
+            logger.warning("TICKETMASTER_API_KEY no configurada — omitiendo Ticketmaster Nacional.")
         else:
             try:
                 from scraper.sources.ticketmaster_nacional import TicketmasterNacionalScraper
@@ -94,7 +104,7 @@ async def run_scraper(
     # ── 2. Ticketmaster Jalisco (legacy) ─────────────────────────────
     if run_all or "ticketmaster_jalisco" in (sources or []):
         if not ticketmaster_key:
-            logger.warning("TICKETMASTER_API_KEY no configurada.")
+            logger.warning("TICKETMASTER_API_KEY no configurada — omitiendo Ticketmaster Jalisco.")
         else:
             try:
                 from scraper.sources.ticketmaster_jalisco import TicketmasterJaliscoScraper
@@ -108,7 +118,7 @@ async def run_scraper(
     # ── 3. Eventbrite Nacional v2 ─────────────────────────────────────
     if run_all or "eventbrite_nacional" in (sources or []):
         if not eventbrite_token:
-            logger.warning("EVENTBRITE_TOKEN no configurado.")
+            logger.warning("EVENTBRITE_TOKEN no configurado — omitiendo Eventbrite Nacional.")
         else:
             try:
                 from scraper.sources.eventbrite_nacional import EventbriteNacionalScraper
@@ -122,7 +132,7 @@ async def run_scraper(
     # ── 4. Eventbrite GDL (legacy, solo si se pide explícitamente) ────
     if "eventbrite" in (sources or []):
         if not eventbrite_token:
-            logger.warning("EVENTBRITE_TOKEN no configurado.")
+            logger.warning("EVENTBRITE_TOKEN no configurado — omitiendo Eventbrite GDL.")
         else:
             try:
                 from scraper.sources.eventbrite import EventbriteScraper
@@ -133,7 +143,7 @@ async def run_scraper(
             except Exception as exc:
                 logger.error("❌  Eventbrite GDL: %s", exc)
 
-    # ── 5. Songkick ★ ─────────────────────────────────────────────────
+    # ── 5. Songkick ───────────────────────────────────────────────────
     if run_all or "songkick" in (sources or []):
         try:
             from scraper.sources.songkick import SongkickScraper
@@ -144,7 +154,7 @@ async def run_scraper(
         except Exception as exc:
             logger.error("❌  Songkick: %s", exc)
 
-    # ── 6. Fuentes Nacionales ★ ───────────────────────────────────────
+    # ── 6. Fuentes Nacionales ─────────────────────────────────────────
     if run_all or "fuentes_nacionales" in (sources or []):
         try:
             from scraper.sources.fuentes_nacionales import FuentesNacionalesScraper
@@ -177,7 +187,21 @@ async def run_scraper(
         except Exception as exc:
             logger.error("❌  SIC API REST: %s", exc)
 
-    # ── 9. SIC Datos Abiertos ─────────────────────────────────────────
+    # ── 9. Ticketmaster LATAM ─────────────────────────────────────────
+    if run_all or "ticketmaster_latam" in (sources or []):
+        if not ticketmaster_key:
+            logger.warning("TICKETMASTER_API_KEY no configurada — omitiendo TM LATAM.")
+        else:
+            try:
+                from scraper.sources.ticketmaster_latam import TicketmasterLatamScraper
+                scraper = TicketmasterLatamScraper(api_key=ticketmaster_key)
+                events = await scraper.fetch_events()
+                all_raw_events.extend(events)
+                logger.info("✅  Ticketmaster LATAM: %d eventos", len(events))
+            except Exception as exc:
+                logger.error("❌  Ticketmaster LATAM: %s", exc)
+
+    # ── 10. SIC Datos Abiertos ────────────────────────────────────────
     if run_all or "sic_datos_abiertos" in (sources or []):
         try:
             from scraper.sources.sic_datos_abiertos import SICDatosAbiertos
@@ -188,7 +212,18 @@ async def run_scraper(
         except Exception as exc:
             logger.error("❌  SIC Datos Abiertos: %s", exc)
 
-    # ── 10. datos.gob.mx CKAN ─────────────────────────────────────────
+    # ── 11. Massive Scraper ───────────────────────────────────────────
+    if run_all or "massive_scraper" in (sources or []):
+        try:
+            from scraper.sources.massive_scraper import MassiveScraper
+            scraper = MassiveScraper()
+            events = await scraper.fetch_all()
+            all_raw_events.extend(events)
+            logger.info("✅  Massive Scraper: %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  Massive Scraper: %s", exc)
+
+    # ── 12. datos.gob.mx CKAN ─────────────────────────────────────────
     if run_all or "datos_gob_mx" in (sources or []):
         try:
             from scraper.sources.datos_gob_mx import DatosGobMxScraper
@@ -199,7 +234,7 @@ async def run_scraper(
         except Exception as exc:
             logger.error("❌  datos.gob.mx: %s", exc)
 
-    # ── 11. GDL Nuevas Fuentes ────────────────────────────────────────
+    # ── 13. GDL Nuevas Fuentes ────────────────────────────────────────
     if run_all or "nuevas" in (sources or []):
         try:
             from scraper.sources.gdl_nuevas_fuentes import GDLNuevasFuentesScraper
@@ -210,7 +245,7 @@ async def run_scraper(
         except Exception as exc:
             logger.error("❌  GDL Nuevas Fuentes: %s", exc)
 
-    # ── 12. GDL Local ─────────────────────────────────────────────────
+    # ── 14. GDL Local ─────────────────────────────────────────────────
     if run_all or "local" in (sources or []):
         try:
             from scraper.sources.gdl_local import GDLLocalScraper
@@ -221,15 +256,53 @@ async def run_scraper(
         except Exception as exc:
             logger.error("❌  GDL Local: %s", exc)
 
+    # ── 15. Categorías Faltantes ★ (v7) ──────────────────────────────
+    # Scrapers específicos para deportivo, gastronomico y otro.
+    # Puedes correrlos todos juntos o por subcategoría individual.
+    _run_cats = (
+        run_all
+        or "categorias_faltantes" in (sources or [])
+        or "deportivo"    in (sources or [])
+        or "gastronomico" in (sources or [])
+        or "otro"         in (sources or [])
+    )
+    if _run_cats:
+        try:
+            from scraper.sources.categorias_faltantes import CategoriasFaltantesScraper
+
+            # Si se piden subcategorías individuales, filtramos internamente
+            # pasando el parámetro `only_categories`.
+            only = []
+            if sources and "all" not in sources and "categorias_faltantes" not in sources:
+                if "deportivo"    in sources: only.append("deportivo")
+                if "gastronomico" in sources: only.append("gastronomico")
+                if "otro"         in sources: only.append("otro")
+
+            scraper = CategoriasFaltantesScraper()
+
+            if only:
+                # Ejecutar solo las subcategorías pedidas
+                events = await scraper.fetch_categories(only)
+            else:
+                events = await scraper.fetch_all()
+
+            all_raw_events.extend(events)
+            logger.info("✅  Categorías Faltantes: %d eventos", len(events))
+        except Exception as exc:
+            logger.error("❌  Categorías Faltantes: %s", exc)
+
     # ── Resumen bruto ─────────────────────────────────────────────────
     logger.info("━" * 60)
     logger.info("📦  Total bruto recolectado: %d eventos", len(all_raw_events))
 
     if not all_raw_events:
         logger.info("Sin eventos nuevos.")
-        return {"total": 0, "published": 0, "pending_review": 0, "skipped": 0, "errors": 0}
+        return {
+            "total": 0, "published": 0,
+            "pending_review": 0, "skipped": 0, "errors": 0,
+        }
 
-    # ── Deduplicación en memoria (fingerprint SHA-256) ─────────────────
+    # ── Deduplicación en memoria ──────────────────────────────────────
     try:
         from scraper.pipelines.deduplicate import deduplicate_events
         all_raw_events, dupes = deduplicate_events(all_raw_events)
@@ -238,7 +311,7 @@ async def run_scraper(
             len(all_raw_events), dupes,
         )
     except Exception as exc:
-        logger.warning("Deduplicación falló, continuando: %s", exc)
+        logger.warning("Deduplicación falló, continuando sin ella: %s", exc)
 
     logger.info("📊  Total después de deduplicar: %d eventos", len(all_raw_events))
 
@@ -246,15 +319,24 @@ async def run_scraper(
         logger.info("🔍  Dry-run — muestra de los primeros 10:")
         for i, evt in enumerate(all_raw_events[:10]):
             logger.info(
-                "  [%d] %s | fuente=%-20s | fecha=%s",
+                "  [%02d] %-50s | fuente=%-25s | cat=%-15s | fecha=%s",
                 i + 1,
                 evt.get("title", "Sin título")[:50],
                 evt.get("source_id", "?"),
+                evt.get("category", "?"),
                 str(evt.get("date_start", "?"))[:10],
             )
         if len(all_raw_events) > 10:
             logger.info("  … y %d eventos más", len(all_raw_events) - 10)
-        return {"total": len(all_raw_events), "dry_run": True}
+
+        # Distribución por categoría en dry-run
+        from collections import Counter
+        cat_dist = Counter(e.get("category", "sin_cat") for e in all_raw_events)
+        logger.info("📊  Distribución por categoría:")
+        for cat, count in sorted(cat_dist.items(), key=lambda x: -x[1]):
+            logger.info("     %-20s: %d", cat, count)
+
+        return {"total": len(all_raw_events), "dry_run": True, "by_category": dict(cat_dist)}
 
     # ── Ingestión en MongoDB ───────────────────────────────────────────
     from api.config.database import connect_db, get_db
@@ -278,7 +360,18 @@ async def run_scraper(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Scraper GDL Qué Hacer v6")
+    parser = argparse.ArgumentParser(
+        description="Scraper GDL Qué Hacer v7",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Ejemplos:
+  python -m scraper.scraper                              # todas las fuentes
+  python -m scraper.scraper --source categorias_faltantes
+  python -m scraper.scraper --source deportivo gastronomico otro
+  python -m scraper.scraper --source ticketmaster_nacional --dry-run
+  python -m scraper.scraper --dry-run                    # todas, sin guardar
+        """,
+    )
     parser.add_argument(
         "--source",
         nargs="+",
@@ -306,9 +399,9 @@ def main():
     sources = None if "all" in args.source else args.source
 
     logger.info("━" * 60)
-    logger.info("🕷️   GDL Qué Hacer — Scraper v6")
+    logger.info("🕷️   GDL Qué Hacer — Scraper v7")
     logger.info("   Modo    : %s", "DRY RUN" if args.dry_run else "PRODUCCIÓN")
-    logger.info("   Fuentes : %s", sources or "TODAS (11 fuentes)")
+    logger.info("   Fuentes : %s", sources or "TODAS (15 fuentes)")
     logger.info("   Hora    : %s", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     logger.info("━" * 60)
 

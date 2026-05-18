@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -18,9 +19,7 @@ logger = logging.getLogger(__name__)
 
 def _normalize_title(title: str) -> str:
     """Normaliza título para comparación."""
-    import re
     t = title.lower().strip()
-    # Eliminar caracteres especiales, conservar letras/números
     t = re.sub(r"[^\w\s]", "", t)
     t = re.sub(r"\s+", " ", t)
     return t
@@ -50,7 +49,6 @@ def fingerprint(event: dict) -> str:
     if not ciudad:
         loc = event.get("location", "")
         if isinstance(loc, str):
-            # Tomar la primera parte significativa
             parts = [p.strip() for p in loc.split(",")]
             ciudad = parts[0].lower() if parts else ""
         elif isinstance(loc, dict):
@@ -71,10 +69,10 @@ def deduplicate_events(events: list[dict]) -> tuple[list[dict], int]:
     Returns:
         (eventos_únicos, duplicados_eliminados)
     """
-    seen_source_ids: set[str] = set()
-    seen_fingerprints: set[str] = set()
-    unique: list[dict] = []
-    duplicates = 0
+    seen_source_ids: set[str]    = set()
+    seen_fingerprints: set[str]  = set()
+    unique: list[dict]           = []
+    duplicates                   = 0
 
     for evt in events:
         # Clave exacta por fuente
@@ -99,6 +97,6 @@ def deduplicate_events(events: list[dict]) -> tuple[list[dict], int]:
 
     logger.info(
         "Deduplicación: %d originales → %d únicos (%d duplicados eliminados)",
-        len(events), len(unique), duplicates
+        len(events), len(unique), duplicates,
     )
     return unique, duplicates
